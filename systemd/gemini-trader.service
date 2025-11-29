@@ -1,0 +1,26 @@
+[Unit]
+Description=Gemini Trader AI - Options Trading System
+After=network.target
+
+[Service]
+Type=simple
+User=jakub
+WorkingDirectory=/home/jakub/.gemini/antigravity/scratch/gemini-trader-ai
+Environment="PATH=/home/jakub/.gemini/antigravity/scratch/gemini-trader-ai/venv/bin"
+ExecStart=/home/jakub/.gemini/antigravity/scratch/gemini-trader-ai/venv/bin/python main.py
+
+# Restart policy
+Restart=on-failure
+RestartSec=30
+
+# Resource limits (optional, tune as needed)
+MemoryLimit=1G
+CPUQuota=50%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gemini-trader
+
+[Install]
+WantedBy=multi-user.target
