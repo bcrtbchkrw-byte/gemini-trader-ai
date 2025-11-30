@@ -29,6 +29,160 @@ class ClaudeClient:
         
         logger.info("Claude AI client initialized with model: " + self.model)
     
+    async def analyze_strategy(
+        self,
+        stock_data: Dict[str, Any],
+        options_data: Dict[str, Any],
+        strategy_type: str
+    ) -> Dict[str, Any]:
+        """
+        Phase 2: Analyze specific strategy with confidence scoring
+        
+        Returns confidence score (1-10) instead of binary approval.
+        Only trades with confidence >= 9 are executed.
+        
+        Args:
+            stock_data: Stock market data
+            options_data: Option Greeks and pricing
+            strategy_type: e.g., "IRON_CONDOR", "VERTICAL_SPREAD"
+            
+        Returns:
+            Analysis with confidence_score (1-10) and reasoning
+        """
+        try:
+            prompt = f"""You are analyzing a {strategy_type} options strategy for {stock_data['symbol']}.
+
+**CRITICAL: Provide a CONFIDENCE SCORE (1-10)**
+- 1-3: Low confidence - clear red flags
+- 4-6: Medium confidence - some concerns
+- 7-8: Good confidence - minor concerns
+- 9-10: High confidence - strong setup
+**Trade ONLY if confidence >= 9/10**
+
+Stock Data:
+- Symbol: {stock_data['symbol']}
+- Price: ${stock_data.get('price', 'N/A')}
+- IV Rank: {stock_data.get('iv_rank', 'N/A')}
+- Volume: {stock_data.get('volume', 'N/A'):,}
+- Sector: {stock_data.get('sector', 'Unknown')}
+
+Option Greeks:
+- Delta: {options_data.get('delta', 'N/A')}
+- Gamma: {options_data.get('gamma', 'N/A')}
+- Theta: {options_data.get('theta', 'N/A')}
+- Vega: {options_data.get('vega', 'N/A')}
+- Vanna: {options_data.get('vanna', 'N/A')}
+- Implied Vol: {options_data.get('impl_vol', 'N/A')}
+
+Strategy: {strategy_type}
+
+Analyze this setup and provide:
+
+1. **CONFIDENCE SCORE**: X/10 (required - be honest!)
+
+2. **Key Strengths** (what makes this attractive):
+   - List 2-3 strongest points
+
+3. **Key Risks** (what could go wrong):
+   - List 2-3 main concerns
+
+4. **Decision** (APPROVE or REJECT):
+   - APPROVE only if confidence >= 9/10
+   - REJECT if confidence < 9/10
+
+5. **Reasoning** (2-3 sentences):
+   - Why this confidence score?
+   - What would improve it?
+
+Be conservative. If unsure, confidence should be 7 or below.
+Quality > Quantity. Better to skip marginal setups.
+
+Format response as JSON:
+{{
+    "confidence_score": 9,
+    "decision": "APPROVE",
+    "strengths": ["strength1", "strength2"],
+    "risks": ["risk1", "risk2"],
+    "reasoning": "explanation",
+    "greeks_validated": true
+}}
+"""
+            
+            message = self.client.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            
+            response_text = message.content[0].text
+            
+            # Parse JSON response
+            import json
+            try:
+                # Try to extract JSON from response
+                json_start = response_text.find('{')
+                json_end = response_text.rfind('}') + 1
+                
+                if json_start >= 0 and json_end > json_start:
+                    json_str = response_text[json_start:json_end]
+                    analysis = json.loads(json_str)
+                else:
+                    raise ValueError("No JSON found in response")
+                
+            except Exception as e:
+                logger.warning(f"Failed to parse JSON: {e}, using fallback")
+                # Fallback parsing
+                analysis = {
+                    'confidence_score': 5,  # Low confidence if parsing fails
+                    'decision': 'REJECT',
+                    'reasoning': response_text,
+                    'greeks_validated': False
+                }
+            
+            # Validate confidence score
+            confidence = analysis.get('confidence_score', 0)
+            if not isinstance(confidence, (int, float)) or confidence < 1 or confidence > 10:
+                logger.warning(f"Invalid confidence score: {confidence}, defaulting to 5")
+                confidence = 5
+                analysis['confidence_score'] = 5
+            
+            # Override decision based on confidence threshold
+            if confidence >= 9:
+                analysis['decision'] = 'APPROVE'
+                analysis['approved'] = True
+            else:
+                analysis['decision'] = 'REJECT'
+                analysis['approved'] = False
+                if 'reasoning' in analysis:
+                    analysis['reasoning'] += f" (Confidence {confidence}/10 below threshold of 9)"
+            
+            logger.info(
+                f"Claude analysis: {stock_data['symbol']} "
+                f"Confidence={confidence}/10, Decision={analysis['decision']}"
+            )
+            
+            if confidence < 9:
+                logger.warning(
+                    f"⚠️  Trade REJECTED: Confidence {confidence}/10 below threshold. "
+                    f"Reason: {analysis.get('reasoning', 'N/A')}"
+                )
+            else:
+                logger.info(
+                    f"✅ Trade APPROVED: High confidence ({confidence}/10)"
+                )
+            
+            return analysis
+            
+        except Exception as e:
+            logger.error(f"Error in Claude strategy analysis: {e}")
+            return {
+                'confidence_score': 1,
+                'decision': 'REJECT',
+                'reasoning': f"An unexpected error occurred: {str(e)}",
+                'greeks_validated': False,
+                'approved': False
+            }
+    
     async def analyze_greeks_and_recommend(
         self,
         symbol: str,

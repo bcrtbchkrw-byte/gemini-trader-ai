@@ -41,52 +41,17 @@ class StockScreener:
             # Tech
             "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "INTC", "NFLX",
             # Finance
-            "JPM", "BAC", "WFC", "GS", "MS", "C", "BLK", "SCHW",
-            # Healthcare
-            "UNH", "JNJ", "PFE", "ABBV", "MRK", "TMO", "ABT", "CVS",
-            # Consumer
-            "WMT", "HD", "MCD", "NKE", "SBUX", "TGT", "LOW", "COST",
-            # Energy
-            "XOM", "CVX", "COP", "SLB", "OXY", "MPC", "VLO",
-            # Industrial
-            "BA", "CAT", "GE", "MMM", "HON", "UPS", "LMT", "RTX",
-            # Communication
-            "DIS", "CMCSA", "VZ", "T", "TMUS",
-            # ETFs
-            "SPY", "QQQ", "IWM", "DIA"
-        ]
+        self.connection = get_ibkr_connection()
+        self.min_iv_rank = 50  # Minimum IV percentile
+        self.max_candidates = 10  # Phase 1 output limit
     
-    async def screen(
+    async def scan_high_iv_stocks(
         self,
-        criteria: Optional[ScreeningCriteria] = None,
-        max_results: int = 10
+        max_results: int = 50,
+        min_price: float = 20.0,
+        max_price: float = 500.0
     ) -> List[Dict[str, Any]]:
         """
-        Screen stocks based on criteria
-        
-        Args:
-            criteria: Screening criteria
-            max_results: Maximum number of candidates to return
-            
-        Returns:
-            List of candidate stocks with scores
-        """
-        if criteria is None:
-            criteria = ScreeningCriteria()
-        
-        logger.info(f"Starting Phase 1 screening with {len(self.sp500_symbols)} stocks...")
-        logger.info(f"Criteria: ${criteria.min_price}-${criteria.max_price}, "
-                   f"min_vol={criteria.min_daily_volume:,}, "
-                   f"IV_rank>{criteria.iv_rank_threshold}")
-        
-        candidates = []
-        
-        for symbol in self.sp500_symbols:
-            try:
-                result = await self._evaluate_stock(symbol, criteria)
-                if result and result['passes_filters']:
-                    candidates.append(result)
-            except Exception as e:
                 logger.debug(f"Error evaluating {symbol}: {e}")
                 continue
         
@@ -154,9 +119,128 @@ class StockScreener:
                 technical_score=technical_score,
                 criteria=criteria
             )
+            # Request scan
+            scan_data = await ib.reqScannerDataAsync(scanner)
             
-            result = {
-                'symbol': symbol,
+            if not scan_data:
+                logger.warning("Scanner returned no results")
+                return []
+            
+            logger.info(f"IBKR scanner found {len(scan_data)} stocks")
+            
+            # Process results
+            candidates = []
+            for item in scan_data[:max_results]:
+                try:
+                    contract = item.contractDetails.contract
+                    
+                    # Get additional market data
+                    ticker = ib.reqMktData(contract, '', False, False)
+                    await ib.sleep(1)  # Wait for data
+                    
+                    # Get IV rank (from scanner rank or calculate)
+                    iv_rank = item.rank if hasattr(item, 'rank') else 50
+                    
+                    candidate = {
+                        'symbol': contract.symbol,
+                        'price': ticker.last if ticker.last > 0 else ticker.close,
+                        'iv_rank': iv_rank,
+                        'volume': ticker.volume if ticker.volume > 0 else 0,
+                        'sector': contract.industry if hasattr(contract, 'industry') else 'Unknown',
+                        'distance': item.distance if hasattr(item, 'distance') else None,
+                        'score': 0  # Will calculate below
+                    }
+                    
+                    # Calculate screening score
+                    candidate['score'] = self._calculate_score(candidate)
+                    
+                    candidates.append(candidate)
+                    
+                    # Cancel market data
+                    ib.cancelMktData(contract)
+                    
+                except Exception as e:
+                    logger.debug(f"Error processing scanner item: {e}")
+                    continue
+            
+            # Sort by score
+            candidates.sort(key=lambda x: x['score'], reverse=True)
+            
+            # Return top candidates
+            top_candidates = candidates[:self.max_candidates]
+            
+            logger.info(
+                f"✅ Phase 1 complete: {len(top_candidates)} candidates\n"
+                f"Top 3: {', '.join([c['symbol'] for c in top_candidates[:3]])}"
+            )
+            
+            return top_candidates
+            
+        except Exception as e:
+            logger.error(f"Scanner error: {e}")
+            return []
+    
+    def _calculate_score(self, candidate: Dict[str, Any]) -> float:
+        """
+        Calculate screening score for candidate
+        
+        Factors:
+        - IV rank (higher = better for selling premium)
+        - Price range (prefer mid-range)
+        - Volume (higher = better liquidity)
+        
+        Args:
+            candidate: Stock data
+            
+        Returns:
+            Score (0-100)
+        """
+        score = 0.0
+        
+        # IV rank score (0-50 points)
+        iv_rank = candidate.get('iv_rank', 50)
+        score += min(iv_rank / 2, 50)
+        
+        # Price score (0-25 points) - prefer $50-$200 range
+        price = candidate.get('price', 0)
+        if 50 <= price <= 200:
+            score += 25
+        elif 20 <= price <= 500:
+            score += 15
+        
+        # Volume score (0-25 points)
+        volume = candidate.get('volume', 0)
+        if volume > 1_000_000:
+            score += 25
+        elif volume > 500_000:
+            score += 15
+        elif volume > 100_000:
+            score += 10
+        
+        return score
+    
+    async def screen(
+        self,
+        max_candidates: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        Main screening method - wrapper for scan_high_iv_stocks
+        
+        Args:
+            max_candidates: Max candidates to return
+            
+        Returns:
+            Top candidate stocks
+        """
+        self.max_candidates = max_candidates
+        
+        results = await self.scan_high_iv_stocks(
+            max_results=50,  # Scan 50, return top 10
+            min_price=20.0,
+            max_price=500.0
+        )
+        
+        return resultsymbol,
                 'price': round(price, 2),
                 'avg_volume': avg_volume,
                 'iv_rank': round(iv_rank, 1),

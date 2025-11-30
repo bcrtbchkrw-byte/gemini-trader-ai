@@ -238,6 +238,161 @@ class OrderExecutor:
             logger.error(f"Instant execution error: {e}")
             return None
     
+    async def execute_with_mid_price_pegging(
+        self,
+        contract,
+        action: str,
+        quantity: int,
+        bid: float,
+        ask: float,
+        max_iterations: int = 20,
+        step_cents: float = 0.01,
+        wait_seconds: int = 5
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Execute order with mid-price pegging strategy
+        
+        Strategy:
+        1. Start limit at mid price (bid + ask) / 2
+        2. Wait 5 seconds for fill
+        3. If not filled, move limit 1¢ toward market
+        4. Repeat until filled or max iterations
+        
+        This minimizes slippage while ensuring fills.
+        
+        Args:
+            contract: IBKR contract
+            action: BUY or SELL
+            quantity: Number of contracts
+            bid: Current bid price
+            ask: Current ask price
+            max_iterations: Max price adjustments (default 20)
+            step_cents: Price step size (default $0.01)
+            wait_seconds: Wait time between adjustments (default 5s)
+            
+        Returns:
+            Order fill details or None
+        """
+        import asyncio
+        
+        try:
+            ib = self.connection.get_client()
+            
+            if not ib or not ib.isConnected():
+                logger.error("Not connected to IBKR")
+                return None
+            
+            # Calculate mid price
+            mid_price = (bid + ask) / 2
+            
+            # Starting limit price
+            current_limit = round(mid_price, 2)
+            
+            logger.info(
+                f"🎯 Mid-price pegging: {action} {quantity} {contract.symbol}\n"
+                f"   Bid={bid:.2f}, Ask={ask:.2f}, Mid={mid_price:.2f}\n"
+                f"   Starting limit: ${current_limit:.2f}"
+            )
+            
+            for iteration in range(max_iterations):
+                # Create limit order
+                order = self.create_limit_order(
+                    action=action,
+                    quantity=quantity,
+                    limit_price=current_limit
+                )
+                
+                if not order:
+                    logger.error("Failed to create order")
+                    return None
+                
+                # Place order
+                trade = ib.placeOrder(contract, order)
+                
+                logger.info(
+                    f"[{iteration+1}/{max_iterations}] Order placed @ ${current_limit:.2f}"
+                )
+                
+                # Wait for fill or timeout
+                await asyncio.sleep(wait_seconds)
+                
+                # Check order status
+                if trade.orderStatus.status in ['Filled', 'PartiallyFilled']:
+                    logger.info(
+                        f"✅ FILLED @ ${current_limit:.2f} in {iteration+1} iterations "
+                        f"({(iteration+1) * wait_seconds}s)"
+                    )
+                    
+                    return {
+                        'status': 'FILLED',
+                        'fill_price': trade.orderStatus.avgFillPrice,
+                        'filled_quantity': trade.orderStatus.filled,
+                        'iterations': iteration + 1,
+                        'time_seconds': (iteration + 1) * wait_seconds,
+                        'slippage': abs(trade.orderStatus.avgFillPrice - mid_price),
+                        'method': 'mid_price_pegging'
+                    }
+                
+                # Not filled - cancel and adjust
+                ib.cancelOrder(order)
+                await asyncio.sleep(0.5)  # Brief pause after cancel
+                
+                # Walk price toward market
+                if action == "BUY":
+                    # Move limit up toward ask
+                    current_limit = min(current_limit + step_cents, ask)
+                    logger.debug(f"Adjusting BUY limit up to ${current_limit:.2f}")
+                else:  # SELL
+                    # Move limit down toward bid
+                    current_limit = max(current_limit - step_cents, bid)
+                    logger.debug(f"Adjusting SELL limit down to ${current_limit:.2f}")
+                
+                # Check if we've reached the market
+                if (action == "BUY" and current_limit >= ask) or \
+                   (action == "SELL" and current_limit <= bid):
+                    logger.warning(
+                        f"Reached market price after {iteration+1} iterations, "
+                        f"placing final order at market edge"
+                    )
+                    break
+            
+            # Final attempt at market edge
+            logger.warning(
+                f"⚠️  Max iterations reached, placing final order @ "
+                f"${current_limit:.2f}"
+            )
+            
+            final_order = self.create_limit_order(
+                action=action,
+                quantity=quantity,
+                limit_price=current_limit
+            )
+            
+            if final_order:
+                trade = ib.placeOrder(contract, final_order)
+                await asyncio.sleep(wait_seconds)
+                
+                if trade.orderStatus.status in ['Filled', 'PartiallyFilled']:
+                    return {
+                        'status': 'FILLED',
+                        'fill_price': trade.orderStatus.avgFillPrice,
+                        'filled_quantity': trade.orderStatus.filled,
+                        'iterations': max_iterations,
+                        'time_seconds': max_iterations * wait_seconds,
+                        'method': 'mid_price_pegging_final'
+                    }
+            
+            return {
+                'status': 'NOT_FILLED',
+                'last_limit': current_limit,
+                'iterations': max_iterations,
+                'reason': 'Max iterations exceeded'
+            }
+            
+        except Exception as e:
+            logger.error(f"Mid-price pegging error: {e}")
+            return None
+    
     async def execute_spread_order(
         self,
         spread_legs: List[Dict[str, Any]],
