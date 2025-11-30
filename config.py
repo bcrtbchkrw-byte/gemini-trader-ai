@@ -211,6 +211,20 @@ class SafetyParams:
 
 
 @dataclass
+class DividendConfig:
+    """Dividend risk configuration"""
+    blackout_days: int
+    auto_exit_enabled: bool
+    
+    @classmethod
+    def from_env(cls) -> 'DividendConfig':
+        return cls(
+            blackout_days=int(os.getenv('DIVIDEND_BLACKOUT_DAYS', '5')),
+            auto_exit_enabled=os.getenv('DIVIDEND_AUTO_EXIT', 'true').lower() == 'true'
+        )
+
+
+@dataclass
 class LogConfig:
     """Logging configuration"""
     level: str
@@ -237,6 +251,7 @@ class Config:
     liquidity: LiquidityThresholds
     circuit_breaker: CircuitBreakerConfig
     order_ttl: OrderTTLConfig
+    dividend: DividendConfig
     exit_params: ExitParams
     safety: SafetyParams
     logging: LogConfig # Added this field based on the original __init__
@@ -250,6 +265,7 @@ class Config:
         self.liquidity = LiquidityThresholds.from_env()
         self.circuit_breaker = CircuitBreakerConfig.from_env()
         self.order_ttl = OrderTTLConfig.from_env()
+        self.dividend = DividendConfig.from_env()
         self.exit_params = ExitParams.from_env()
         self.safety = SafetyParams.from_env()
         self.logging = LogConfig.from_env()
