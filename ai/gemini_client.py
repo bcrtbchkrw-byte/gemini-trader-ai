@@ -1,26 +1,57 @@
 """
 Gemini AI Client
-Handles fundamental analysis using Google Gemini AI.
+Handles interactions with Google Gemini API for fast batch analysis with cost tracking.
 """
-from typing import Optional, Dict, Any
+from typing import Dict, Any, List, Optional
 import google.generativeai as genai
 from loguru import logger
+from datetime import datetime, date
+import os
 from config import get_config
 from ai.prompts import get_gemini_fundamental_prompt, parse_gemini_response
 from data.logger import get_ai_logger
 
 
 class GeminiClient:
-    """Client for Google Gemini AI fundamental analysis"""
+    """
+    Gemini API client with token tracking and cost limits
     
-    def __init__(self):
-        config = get_config()
-        genai.configure(api_key=config.ai.gemini_api_key)
+    Token Pricing (Gemini 1.5 Flash):
+    - Input: $0.075 per 1M tokens
+    - Output: $0.30 per 1M tokens
+    """
+    
+    # Gemini 1.5 Flash pricing
+    INPUT_COST_PER_1M = 0.075  # $0.075 per 1M input tokens
+    OUTPUT_COST_PER_1M = 0.30  # $0.30 per 1M output tokens
+    
+    def __init__(self, daily_limit_usd: float = 5.0):
+        """
+        Initialize Gemini client with cost tracking
         
-        # Use Gemini 1.5 Pro for better analysis
-        self.model = genai.GenerativeModel('gemini-1.5-pro-latest')
+        Args:
+            daily_limit_usd: Maximum daily spend in USD (default $5)
+        """
+        self.api_key = os.getenv('GEMINI_API_KEY')
+        if not self.api_key:
+            # Fallback to config if not in environment
+            config = get_config()
+            self.api_key = config.ai.gemini_api_key
+            if not self.api_key:
+                raise ValueError("GEMINI_API_KEY not found in environment or config")
         
-        # AI decision logger
+        genai.configure(api_key=self.api_key)
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # Cost tracking
+        self.daily_limit_usd = daily_limit_usd
+        self.today = date.today()
+        self.daily_input_tokens = 0
+        self.daily_output_tokens = 0
+        self.daily_cost = 0.0
+        self.silent_mode = False
+        
+        logger.info(f"✅ Gemini client initialized (Daily limit: ${daily_limit_usd:.2f})")
         self.ai_logger = get_ai_logger()
         
         logger.info("Gemini AI client initialized")
@@ -114,23 +145,77 @@ class GeminiClient:
         response = await self._generate_async(prompt)
         return response if response else ""
     
+    
+    def _reset_daily_if_needed(self):
+        """Reset counters if new day"""
+        today = date.today()
+        if today != self.today:
+            logger.info(
+                f"📊 Daily Gemini usage reset:\n"
+                f"   Yesterday: {self.daily_input_tokens:,} in + {self.daily_output_tokens:,} out\n"
+                f"   Cost: ${self.daily_cost:.4f}"
+            )
+            self.today = today
+            self.daily_input_tokens = 0
+            self.daily_output_tokens = 0
+            self.daily_cost = 0.0
+            self.silent_mode = False
+    
+    def _track_usage(self, input_tokens: int, output_tokens: int):
+        """Track token usage and cost"""
+        self._reset_daily_if_needed()
+        
+        self.daily_input_tokens += input_tokens
+        self.daily_output_tokens += output_tokens
+        
+        # Calculate cost
+        input_cost = (input_tokens / 1_000_000) * self.INPUT_COST_PER_1M
+        output_cost = (output_tokens / 1_000_000) * self.OUTPUT_COST_PER_1M
+        call_cost = input_cost + output_cost
+        
+        self.daily_cost += call_cost
+        
+        logger.info(
+            f"💰 Gemini usage: {input_tokens:,} in + {output_tokens:,} out = ${call_cost:.4f}\n"
+            f"   Daily total: ${self.daily_cost:.4f} / ${self.daily_limit_usd:.2f}"
+        )
+        
+        # Check limit
+        if self.daily_cost >= self.daily_limit_usd:
+            self.silent_mode = True
+            logger.error(
+                f"🚨 GEMINI DAILY LIMIT REACHED!\n"
+                f"   Spent: ${self.daily_cost:.4f}\n"
+                f"   Limit: ${self.daily_limit_usd:.2f}\n"
+                f"   → SILENT MODE ACTIVATED"
+            )
+    
+    def can_make_request(self) -> bool:
+        """Check if we can make another API request"""
+        self._reset_daily_if_needed()
+        return not self.silent_mode
+    
     async def batch_analyze_with_news(
         self,
-        candidates: list,
-        news_context: Dict[str, list],
+        candidates: List[Dict[str, Any]],
+        news_context: Dict[str, List[Dict]],
         vix: float
     ) -> Dict[str, Any]:
         """
-        Phase 2: Batch analyze multiple stocks with news context
+        Batch analyze stocks with news context and cost tracking
         
-        Args:
-            candidates: List of stock candidates from Phase 1
-            news_context: Dict mapping symbol to news articles
-            vix: Current VIX value
-            
-        Returns:
-            Dict with ranked stocks and top picks
+        Returns early if daily limit exceeded
         """
+        # Check if we can make request
+        if not self.can_make_request():
+            logger.warning("⚠️ Gemini in SILENT MODE (daily limit reached) - skipping analysis")
+            return {
+                'success': False,
+                'error': 'Daily cost limit exceeded',
+                'silent_mode': True,
+                'top_picks': []
+            }
+        
         try:
             from ai.prompts import get_gemini_batch_analysis_prompt
             

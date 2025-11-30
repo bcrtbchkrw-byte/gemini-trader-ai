@@ -292,9 +292,104 @@ class RollingManager:
                 logger.info(f"🎉 ROLL EXECUTED for {position.symbol}!")
                 logger.info(f"   Fill price: ${trade.orderStatus.avgFillPrice:.2f}")
                 
-                # TODO: Update database with new position
-                # - Mark old position as ROLLED
-                # - Create new position entry
+                # ===== UPDATE DATABASE =====
+                logger.info("📝 Updating database with roll...")
+                
+                import aiosqlite
+                async with aiosqlite.connect(self.db.db_path) as db:
+                    # 1. Mark old position as ROLLED (not CLOSED)
+                    await db.execute("""
+                        UPDATE positions
+                        SET status = 'ROLLED',
+                            close_timestamp = ?,
+                            close_price = ?
+                        WHERE id = ?
+                    """, (
+                        datetime.now().isoformat(),
+                        trade.orderStatus.avgFillPrice,
+                        position.position_id
+                    ))
+                    
+                    # 2. Create new position record
+                    cursor = await db.execute("""
+                        INSERT INTO positions (
+                            symbol,
+                            strategy,
+                            entry_timestamp,
+                            expiration,
+                            num_contracts,
+                            credit_received,
+                            max_risk,
+                            status,
+                            notes,
+                            rolled_from_position_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+                    """, (
+                        position.symbol,
+                        position.strategy,
+                        datetime.now().isoformat(),
+                        proposal['new_expiration'],
+                        position.contracts,
+                        abs(trade.orderStatus.avgFillPrice),  # Credit from roll
+                        width,  # Max risk = width
+                        f"Rolled from position {position.position_id}",
+                        position.position_id  # Link to old position
+                    ))
+                    
+                    new_position_id = cursor.lastrowid
+                    
+                    # 3. Create new position legs
+                    # Short leg
+                    await db.execute("""
+                        INSERT INTO position_legs (
+                            position_id,
+                            leg_type,
+                            option_type,
+                            strike,
+                            expiration,
+                            quantity,
+                            action
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        new_position_id,
+                        'SHORT',
+                        short_leg['option_type'],
+                        new_short_strike,
+                        proposal['new_expiration'],
+                        position.contracts,
+                        'SELL'
+                    ))
+                    
+                    # Long leg
+                    await db.execute("""
+                        INSERT INTO position_legs (
+                            position_id,
+                            leg_type,
+                            option_type,
+                            strike,
+                            expiration,
+                            quantity,
+                            action
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        new_position_id,
+                        'LONG',
+                        long_leg['option_type'],
+                        new_long_strike,
+                        proposal['new_expiration'],
+                        position.contracts,
+                        'BUY'
+                    ))
+                    
+                    await db.commit()
+                    
+                    logger.info(
+                        f"✅ Database updated:\n"
+                        f"   Old position {position.position_id}: ROLLED\n"
+                        f"   New position {new_position_id}: OPEN\n"
+                        f"   New strikes: {new_short_strike}/{new_long_strike}\n"
+                        f"   New expiration: {proposal['new_expiration']}"
+                    )
                 
                 return True
             else:

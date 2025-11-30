@@ -1,6 +1,6 @@
 """
 Claude AI Client
-Handles advanced Greeks analysis and trade recommendations using Claude Opus.
+Handles deep strategy analysis with Anthropic Claude with cost tracking.
 """
 from typing import Optional, Dict, Any, List
 from anthropic import Anthropic
@@ -8,13 +8,34 @@ from loguru import logger
 from config import get_config
 from ai.prompts import get_claude_greeks_analysis_prompt, parse_claude_response
 from data.logger import get_ai_logger
+from datetime import datetime, date
+import os
 
 
 class ClaudeClient:
-    """Client for Claude Opus AI Greeks analysis and trade recommendations"""
+    """
+    Claude API client with token tracking and cost limits
     
-    def __init__(self):
+    Token Pricing (Claude 3.5 Sonnet):
+    - Input: $3.00 per 1M tokens
+    - Output: $15.00 per 1M tokens
+    """
+    
+    # Claude 3.5 Sonnet pricing
+    INPUT_COST_PER_1M = 3.00  # $3 per 1M input tokens
+    OUTPUT_COST_PER_1M = 15.00  # $15 per 1M output tokens
+    
+    def __init__(self, daily_limit_usd: float = 5.0):
         config = get_config()
+        
+        # Cost tracking
+        self.daily_limit_usd = daily_limit_usd
+        self.today = date.today()
+        self.daily_input_tokens = 0
+        self.daily_output_tokens = 0
+        self.daily_cost = 0.0
+        self.silent_mode = False
+        
         self.client = Anthropic(api_key=config.ai.anthropic_api_key)
         
         # Use Claude Opus 4 for best analysis
@@ -29,6 +50,56 @@ class ClaudeClient:
         
         logger.info("Claude AI client initialized with model: " + self.model)
     
+    
+    def _reset_daily_if_needed(self):
+        """Reset counters if new day"""
+        today = date.today()
+        if today != self.today:
+            logger.info(
+                f"📊 Daily Claude usage reset:\n"
+                f"   Yesterday: {self.daily_input_tokens:,} in + {self.daily_output_tokens:,} out\n"
+                f"   Cost: ${self.daily_cost:.4f}"
+            )
+            self.today = today
+            self.daily_input_tokens = 0
+            self.daily_output_tokens = 0
+            self.daily_cost = 0.0
+            self.silent_mode = False
+    
+    def _track_usage(self, input_tokens: int, output_tokens: int):
+        """Track token usage and cost"""
+        self._reset_daily_if_needed()
+        
+        self.daily_input_tokens += input_tokens
+        self.daily_output_tokens += output_tokens
+        
+        # Calculate cost (Claude is more expensive than Gemini!)
+        input_cost = (input_tokens / 1_000_000) * self.INPUT_COST_PER_1M
+        output_cost = (output_tokens / 1_000_000) * self.OUTPUT_COST_PER_1M
+        call_cost = input_cost + output_cost
+        
+        self.daily_cost += call_cost
+        
+        logger.info(
+            f"💰 Claude usage: {input_tokens:,} in + {output_tokens:,} out = ${call_cost:.4f}\n"
+            f"   Daily total: ${self.daily_cost:.4f} / ${self.daily_limit_usd:.2f}"
+        )
+        
+        # Check limit
+        if self.daily_cost >= self.daily_limit_usd:
+            self.silent_mode = True
+            logger.error(
+                f"🚨 CLAUDE DAILY LIMIT REACHED!\n"
+                f"   Spent: ${self.daily_cost:.4f}\n"
+                f"   Limit: ${self.daily_limit_usd:.2f}\n"
+                f"   → SILENT MODE ACTIVATED"
+            )
+    
+    def can_make_request(self) -> bool:
+        """Check if we can make another API request"""
+        self._reset_daily_if_needed()
+        return not self.silent_mode
+    
     async def analyze_strategy(
         self,
         stock_data: Dict[str, Any],
@@ -36,6 +107,10 @@ class ClaudeClient:
         strategy_type: str
     ) -> Dict[str, Any]:
         """
+        Deep analysis with Claude and cost tracking
+        
+        Returns early if daily limit exceeded
+        
         Phase 2: Analyze specific strategy with confidence scoring
         
         Returns confidence score (1-10) instead of binary approval.
@@ -108,11 +183,27 @@ Format response as JSON:
 }}
 """
             
+            # Call Claude API
             message = self.client.messages.create(
                 model="claude-3-5-sonnet-20241022",
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}]
+                max_tokens=2000,
+                messages=[{
+                    "role": "user",
+                    "content": prompt
+                }]
             )
+            
+            # Track token usage from response
+            if hasattr(message, 'usage'):
+                input_tokens = message.usage.input_tokens
+                output_tokens = message.usage.output_tokens
+                self._track_usage(input_tokens, output_tokens)
+            else:
+                # Estimate if usage data unavailable
+                estimated_input = len(prompt) // 4
+                estimated_output = len(message.content[0].text) // 4
+                self._track_usage(estimated_input, estimated_output)
+                logger.warning("⚠️ Using estimated token counts (usage data unavailable)")
             
             response_text = message.content[0].text
             

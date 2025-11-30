@@ -10,8 +10,10 @@ from config import get_config
 class PositionSizer:
     """Calculate position sizes within risk limits"""
     
-    def __init__(self):
-        self.config = get_config().trading
+    def __init__(self, config=None, ibkr=None):
+        from config import get_config as _get_config
+        self.config = config.trading if config else _get_config().trading
+        self.ibkr = ibkr  # IBKR connection for available funds
     
     def calculate_max_contracts(
         self,
@@ -96,6 +98,92 @@ class PositionSizer:
                 'total_capital_used': 0,
                 'percent_of_account': 0,
                 'within_limits': False,
+                'error': str(e)
+            }
+    
+    async def calculate_position_size(
+        self,
+        max_risk: float,
+        strategy_type: str = "CREDIT_SPREAD",
+        account_risk_pct: float = 2.0
+    ) -> Dict[str, Any]:
+        """
+        Calculate position size based on available funds (not NetLiq)
+        
+        🆕 Uses AvailableFunds for accurate sizing
+        
+        Args:
+            max_risk: Maximum risk per contract
+            strategy_type: Type of strategy
+            account_risk_pct: % of AVAILABLE funds to risk (default 2%)
+            
+        Returns:
+            Dict with num_contracts, total_risk, account_pct
+        """
+        try:
+            # 🆕 GET AVAILABLE FUNDS (not NetLiquidation)
+            available_funds = await self.ibkr.get_available_funds()
+            
+            if available_funds is None or available_funds <= 0:
+                logger.error("❌ Could not fetch available funds")
+                # Fallback to NetLiq if AvailableFunds unavailable
+                logger.warning("⚠️ Falling back to NetLiquidation")
+                available_funds = await self.ibkr.get_account_balance()
+                
+                if available_funds is None:
+                    return {
+                        'num_contracts': 0,
+                        'total_risk': 0,
+                        'account_pct': 0,
+                        'error': 'Could not fetch account value'
+                    }
+            
+            # Calculate max risk based on AVAILABLE funds
+            max_account_risk = available_funds * (account_risk_pct / 100.0)
+            
+            # Calculate number of contracts
+            if max_risk > 0:
+                num_contracts = int(max_account_risk / max_risk)
+            else:
+                num_contracts = 0
+            
+            # Cap at max contracts per position
+            max_contracts = self.config.max_contracts_per_position
+            if num_contracts > max_contracts:
+                logger.warning(
+                    f"⚠️ Position size capped: {num_contracts} → {max_contracts} contracts"
+                )
+                num_contracts = max_contracts
+            
+            # Ensure at least 1 contract if we have enough funds
+            if num_contracts == 0 and max_account_risk >= max_risk:
+                num_contracts = 1
+            
+            total_risk = num_contracts * max_risk
+            actual_pct = (total_risk / available_funds * 100) if available_funds > 0 else 0
+            
+            logger.info(
+                f"📊 Position Sizing:\n"
+                f"   Available Funds: ${available_funds:,.2f}\n"
+                f"   Max Risk ({account_risk_pct}%): ${max_account_risk:,.2f}\n"
+                f"   Risk per contract: ${max_risk:.2f}\n"
+                f"   → {num_contracts} contracts (${total_risk:.2f} total risk = {actual_pct:.2f}%)"
+            )
+            
+            return {
+                'num_contracts': num_contracts,
+                'total_risk': total_risk,
+                'account_pct': actual_pct,
+                'available_funds': available_funds,
+                'max_account_risk': max_account_risk
+            }
+            
+        except Exception as e:
+            logger.error(f"Error calculating position size: {e}")
+            return {
+                'num_contracts': 0,
+                'total_risk': 0,
+                'account_pct': 0,
                 'error': str(e)
             }
     

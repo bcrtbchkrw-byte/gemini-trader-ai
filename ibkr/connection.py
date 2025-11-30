@@ -75,27 +75,122 @@ class IBKRConnection:
             logger.error(f"Error verifying account: {e}")
     
     async def get_account_balance(self) -> Optional[float]:
-        """
-        Get account net liquidation value
+        """Get current account balance (NetLiquidation)"""
+        if not self.is_connected():
+            logger.error("Not connected to IBKR")
+            return None
         
-        Returns:
-            float or None: Account balance in USD
-        """
         try:
-            account_values = self.ib.accountValues(self.config.account)
+            account_values = self.ib.accountValues()
             
-            for av in account_values:
-                if av.tag == 'NetLiquidation' and av.currency == 'USD':
-                    balance = float(av.value)
-                    logger.info(f"Account balance: ${balance:.2f}")
+            for value in account_values:
+                if value.tag == 'NetLiquidation' and value.currency == 'USD':
+                    balance = float(value.value)
+                    logger.info(f"Account balance (NetLiq): ${balance:,.2f}")
                     return balance
             
-            logger.warning("Could not find NetLiquidation value")
+            logger.warning("NetLiquidation value not found")
             return None
             
         except Exception as e:
             logger.error(f"Error fetching account balance: {e}")
             return None
+    
+    async def get_available_funds(self) -> Optional[float]:
+        """
+        Get available funds for trading (AvailableFunds)
+        
+        This is the actual cash/margin available for new positions,
+        excluding funds tied up in existing positions.
+        
+        Returns:
+            Available funds in USD
+        """
+        if not self.is_connected():
+            logger.error("Not connected to IBKR")
+            return None
+        
+        try:
+            account_values = self.ib.accountValues()
+            
+            for value in account_values:
+                if value.tag == 'AvailableFunds' and value.currency == 'USD':
+                    available = float(value.value)
+                    logger.info(f"💰 Available Funds: ${available:,.2f}")
+                    return available
+            
+            logger.warning("AvailableFunds value not found")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error fetching available funds: {e}")
+            return None
+    
+    async def get_buying_power(self) -> Optional[float]:
+        """
+        Get buying power (BuyingPower)
+        
+        This includes margin leverage and is typically higher than AvailableFunds.
+        For conservative position sizing, use AvailableFunds instead.
+        
+        Returns:
+            Buying power in USD
+        """
+        if not self.is_connected():
+            logger.error("Not connected to IBKR")
+            return None
+        
+        try:
+            account_values = self.ib.accountValues()
+            
+            for value in account_values:
+                if value.tag == 'BuyingPower' and value.currency == 'USD':
+                    buying_power = float(value.value)
+                    logger.info(f"💪 Buying Power: ${buying_power:,.2f}")
+                    return buying_power
+            
+            logger.warning("BuyingPower value not found")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error fetching buying power: {e}")
+            return None
+    
+    async def get_account_summary(self) -> Dict[str, float]:
+        """
+        Get comprehensive account summary
+        
+        Returns:
+            Dict with NetLiquidation, AvailableFunds, BuyingPower, etc.
+        """
+        if not self.is_connected():
+            logger.error("Not connected to IBKR")
+            return {}
+        
+        try:
+            account_values = self.ib.accountValues()
+            
+            summary = {}
+            for value in account_values:
+                if value.currency == 'USD':
+                    if value.tag in ['NetLiquidation', 'AvailableFunds', 'BuyingPower', 
+                                    'TotalCashValue', 'GrossPositionValue']:
+                        summary[value.tag] = float(value.value)
+            
+            logger.info(
+                f"📊 Account Summary:\n"
+                f"   NetLiquidation: ${summary.get('NetLiquidation', 0):,.2f}\n"
+                f"   AvailableFunds: ${summary.get('AvailableFunds', 0):,.2f}\n"
+                f"   BuyingPower: ${summary.get('BuyingPower', 0):,.2f}\n"
+                f"   Cash: ${summary.get('TotalCashValue', 0):,.2f}\n"
+                f"   Positions: ${summary.get('GrossPositionValue', 0):,.2f}"
+            )
+            
+            return summary
+            
+        except Exception as e:
+            logger.error(f"Error fetching account summary: {e}")
+            return {}
 
     
     def _on_disconnected(self):

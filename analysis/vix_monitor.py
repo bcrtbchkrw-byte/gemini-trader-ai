@@ -1,6 +1,6 @@
 """
-VIX Monitor - Enhanced Market Regime Detection
-Monitors VIX spot + term structure (VIX/VIX3M) for comprehensive regime analysis.
+VIX Monitor - Market Regime Detection with ML Integration
+Monitors VIX and uses ML for regime classification with rule-based fallback.
 """
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
@@ -11,24 +11,39 @@ from ibkr.data_fetcher import get_data_fetcher
 
 class VIXMonitor:
     """
-    Monitor VIX and term structure for market regime detection
+    Monitor VIX and classify market regime
     
-    Term structure features:
-    - VIX/VIX3M ratio
-    - Contango vs Backwardation
-    - Stress level classification
+    🤖 ML-Enhanced: Uses XGBoost RegimeClassifier when available
+    📊 Fallback: Uses simple VIX threshold rules
     """
     
     def __init__(self):
-        self.config = get_config().vix_regimes # Keep this for now, might be replaced by new regime logic
-        self.data_fetcher = get_data_fetcher()
-        
         self.current_vix: Optional[float] = None
         self.current_vix3m: Optional[float] = None
         self.vix_ratio: Optional[float] = None  # VIX / VIX3M
         self.term_structure: Optional[str] = None  # 'CONTANGO' or 'BACKWARDATION'
-        self._current_regime: Optional[str] = None # Renamed from _current_regime to match new structure
-        self._last_update: Optional[datetime] = None # Renamed from _last_update to match new structure
+        self._current_regime: Optional[str] = None
+        self._last_update: Optional[datetime] = None
+        self.history = []
+        
+        # ML Integration
+        self.use_ml = True  # Toggle ML vs rule-based
+        self.ml_classifier = None
+        self.feature_engineer = None
+        
+        # Try to load ML components
+        try:
+            from ml.regime_classifier import get_regime_classifier
+            from ml.feature_engineering import get_feature_engineer
+            
+            self.ml_classifier = get_regime_classifier()
+            self.feature_engineer = get_feature_engineer()
+            
+            logger.info("✅ VIXMonitor: ML components loaded")
+        except Exception as e:
+            logger.warning(f"⚠️ VIXMonitor: ML components unavailable - {e}")
+            logger.info("   Using rule-based regime detection")
+            self.use_ml = False
         
         # Enhanced regime thresholds (example, adjust as needed)
         self.regimes = {
@@ -39,53 +54,104 @@ class VIXMonitor:
             'EXTREME': {'vix_min': 40, 'ratio_min': 1.1}
         }
     
-    async def update(self) -> bool:
-        """
-        Fetch latest VIX value and update regime
-        
-        Returns:
-            bool: True if successful, False otherwise
-        """
+    async def update(self):
+        """Fetch latest VIX value"""
         try:
-            vix_value = await self.data_fetcher.get_vix()
-            vix3m_value = await self.data_fetcher.get_vix3m() # Assuming a new method for VIX3M
+            # Fetch VIX from yfinance
+            import yfinance as yf
+            vix_ticker = yf.Ticker("^VIX")
+            vix_data = vix_ticker.history(period="5d")
             
-            if vix_value is None or vix3m_value is None:
-                logger.warning("Failed to fetch VIX or VIX3M value")
-                return False
-            
-            old_regime = self._current_regime
-            self.current_vix = vix_value
-            self.current_vix3m = vix3m_value
-            
-            self._calculate_term_structure() # Calculate ratio and term structure
-            self._current_regime = self._determine_enhanced_regime() # Determine regime based on new logic
-            self._last_update = datetime.now()
-            
-            # Log regime changes
-            if old_regime and old_regime != self._current_regime:
-                logger.warning(
-                    f"⚠️ VIX REGIME CHANGE: {old_regime} → {self._current_regime} "
-                    f"(VIX: {self.current_vix:.2f}, VIX3M: {self.current_vix3m:.2f}, Ratio: {self.vix_ratio:.3f})"
-                )
+            if not vix_data.empty:
+                self.current_vix = vix_data['Close'].iloc[-1]
+                self._last_update = datetime.now() # Changed from self.last_update to self._last_update
+                self.history.append({
+                    'timestamp': self._last_update, # Changed from self.last_update to self._last_update
+                    'value': self.current_vix
+                })
+                logger.info(f"📊 VIX updated: {self.current_vix:.2f}")
             else:
-                logger.info(
-                    f"VIX Update: Spot={self.current_vix:.2f}, "
-                    f"3M={self.current_vix3m:.2f}, "
-                    f"Ratio={self.vix_ratio:.3f}, "
-                    f"Structure={self.term_structure}, "
-                    f"Regime={self._current_regime}"
-                )
-            
-            return True
-            
+                logger.warning("No VIX data available")
+                
         except Exception as e:
             logger.error(f"Error updating VIX: {e}")
-            return False
-    
+
+
+# Singleton
+_vix_monitor: Optional[VIXMonitor] = None
+
+
+def get_vix_monitor() -> VIXMonitor:
+    """Get or create singleton VIX monitor"""
+    global _vix_monitor
+    if _vix_monitor is None:
+        _vix_monitor = VIXMonitor()
+    return _vix_monitor
+
+    def _calculate_term_structure(self):
+        """Calculates VIX ratio and term structure type."""
+        if self.current_vix and self.current_vix3m and self.current_vix3m != 0:
+            self.vix_ratio = self.current_vix / self.current_vix3m
+            self.term_structure = 'CONTANGO' if self.vix_ratio < 1.0 else 'BACKWARDATION'
+        else:
+            self.vix_ratio = None
+            self.term_structure = None
+
+    def _determine_enhanced_regime(self) -> str:
+        """
+        Determines the market regime based on VIX spot and term structure,
+        with an option to use ML prediction.
+        """
+        if self.current_vix is None or self.vix_ratio is None:
+            return "UNKNOWN"
+
+        # 🤖 TRY ML PREDICTION FIRST
+        if self.use_ml:
+            try:
+                # Extract features from current market state
+                # Assuming 'SPY' as a proxy for market features, adjust as needed
+                features = self.feature_engineer.extract_features(
+                    symbol='SPY',
+                    lookback_days=30
+                )
+                
+                if features is not None:
+                    # Get ML prediction
+                    ml_regime = self.ml_classifier.predict_regime(features)
+                    
+                    logger.info(
+                        f"🤖 ML Regime Prediction: {ml_regime} "
+                        f"(VIX: {self.current_vix:.2f}, Ratio: {self.vix_ratio:.3f})"
+                    )
+                    return ml_regime
+                else:
+                    logger.warning("ML features extraction failed - using rule-based fallback")
+                    
+            except Exception as e:
+                logger.warning(f"ML prediction failed: {e} - using rule-based fallback")
+
+        # 📊 FALLBACK: Rule-based regime (original logic, adapted for VIX/VIX3M)
+        if self.current_vix >= self.regimes['EXTREME']['vix_min'] and \
+           self.vix_ratio >= self.regimes['EXTREME']['ratio_min']:
+            return "EXTREME"
+        elif self.current_vix >= self.regimes['HIGH_VOL']['vix_max'] and \
+             self.vix_ratio >= self.regimes['HIGH_VOL']['ratio_max']:
+            return "HIGH_VOL"
+        elif self.current_vix >= self.regimes['ELEVATED']['vix_max'] and \
+             self.vix_ratio >= self.regimes['ELEVATED']['ratio_max']:
+            return "ELEVATED"
+        elif self.current_vix >= self.regimes['NORMAL']['vix_max'] and \
+             self.vix_ratio >= self.regimes['NORMAL']['ratio_max']:
+            return "NORMAL"
+        elif self.current_vix <= self.regimes['LOW_VOL']['vix_max'] and \
+             self.vix_ratio <= self.regimes['LOW_VOL']['ratio_max']:
+            return "LOW_VOL"
+        else:
+            return "NORMAL" # Default or catch-all
+
     def get_current_vix(self) -> Optional[float]:
         """Get current VIX value"""
-        return self._current_vix
+        return self.current_vix
     
     def get_current_regime(self) -> Optional[str]:
         """Get current market regime"""
@@ -98,8 +164,9 @@ class VIXMonitor:
         Returns:
             bool: True if trading allowed, False if in PANIC mode
         """
-        if self._current_regime == "PANIC":
-            logger.warning("🛑 TRADING BLOCKED: VIX in PANIC mode (>30)")
+        # Assuming "EXTREME" or "HIGH_VOL" might be considered "PANIC" for trading restrictions
+        if self._current_regime in ["EXTREME", "HIGH_VOL"]: # Adjusted from "PANIC"
+            logger.warning(f"🛑 TRADING BLOCKED: VIX in {self._current_regime} mode")
             return False
         return True
     

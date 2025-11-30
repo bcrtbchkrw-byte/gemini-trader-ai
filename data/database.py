@@ -53,17 +53,35 @@ class Database:
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS positions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    trade_id INTEGER,
                     symbol TEXT NOT NULL,
                     strategy TEXT NOT NULL,
                     entry_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    current_price REAL,
-                    current_pnl REAL,
-                    delta REAL,
-                    theta REAL,
-                    vega REAL,
-                    last_update DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (trade_id) REFERENCES trades(id)
+                    expiration TEXT,
+                    num_contracts INTEGER,
+                    credit_received REAL,
+                    max_risk REAL,
+                    status TEXT DEFAULT 'OPEN',
+                    close_timestamp DATETIME,
+                    close_price REAL,
+                    realized_pnl REAL,
+                    notes TEXT,
+                    rolled_from_position_id INTEGER,
+                    FOREIGN KEY (rolled_from_position_id) REFERENCES positions(id)
+                )
+            """)
+            
+            # Position legs (for multi-leg strategies)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS position_legs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    position_id INTEGER NOT NULL,
+                    leg_type TEXT,
+                    option_type TEXT,
+                    strike REAL,
+                    expiration TEXT,
+                    quantity INTEGER,
+                    action TEXT,
+                    FOREIGN KEY (position_id) REFERENCES positions(id)
                 )
             """)
             

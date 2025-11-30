@@ -111,15 +111,30 @@ class OrderManager:
             self._active_orders[trade.order.orderId] = trade
             self._order_timestamps[trade.order.orderId] = datetime.now()
             
-            # Log trade
-            self.trade_logger.info(
-                f"SPREAD ORDER PLACED - ID: {trade.order.orderId}\n"
-                f"Symbol: {symbol}, Type: {'Credit' if is_credit else 'Debit'}\n"
-                f"Short: {short_strike}{right}, Long: {long_strike}{right}\n"
-                f"Expiration: {expiration}, Contracts: {num_contracts}\n"
-                f"Limit Price: ${limit_price:.2f}"
-            )
+            # Wait for fill confirmation (with timeout)
+            import asyncio
+            for _ in range(30):  # 30 seconds max
+                await asyncio.sleep(1)
+                if trade.orderStatus.status in ['Filled', 'Cancelled']:
+                    break
             
+            # Get actual filled quantity
+            filled_qty = trade.orderStatus.filled if hasattr(trade.orderStatus, 'filled') else num_contracts
+            avg_fill_price = trade.orderStatus.avgFillPrice if hasattr(trade.orderStatus, 'avgFillPrice') else limit_price
+            
+            # Log trade with ACTUAL filled quantities
+            self.trade_logger.info(
+                f"VERTICAL SPREAD {'FILLED' if trade.orderStatus.status == 'Filled' else 'PLACED'} - ID: {trade.order.orderId}\n"
+                f"  Symbol: {symbol}\n"
+                f"  Type: {'CREDIT' if is_credit else 'DEBIT'}\n"
+                f"  Strikes: {short_strike}/{long_strike} {right}\n"
+                f"  Expiration: {expiration}\n"
+                f"  Requested: {num_contracts} contracts\n"
+                f"  Filled: {filled_qty} contracts\n"
+                f"  Limit Price: ${limit_price:.2f}\n"
+                f"  Avg Fill: ${avg_fill_price:.2f}\n"
+                f"  Status: {trade.orderStatus.status}"
+            )
             logger.info(f"✅ Order placed successfully. Order ID: {trade.order.orderId}")
             
             return {
@@ -133,7 +148,12 @@ class OrderManager:
                 'num_contracts': num_contracts,
                 'limit_price': limit_price,
                 'status': trade.orderStatus.status,
-                'trade': trade
+                'trade': trade,
+                'filled_qty': filled_qty,
+                'avg_fill_price': avg_fill_price,
+                'requested_qty': num_contracts,
+                'combo_contract': combo,
+                'order': order
             }
             
         except Exception as e:
@@ -221,14 +241,29 @@ class OrderManager:
             self._active_orders[trade.order.orderId] = trade
             self._order_timestamps[trade.order.orderId] = datetime.now()
             
-            self.trade_logger.info(
-                f"IRON CONDOR PLACED - ID: {trade.order.orderId}\n"
-                f"Symbol: {symbol}, Exp: {expiration}\n"
-                f"Call: {call_short_strike}/{call_long_strike}\n"
-                f"Put: {put_short_strike}/{put_long_strike}\n"
-                f"Contracts: {num_contracts}, Credit: ${limit_price:.2f}"
-            )
+            # Wait for fill confirmation
+            import asyncio
+            for _ in range(30):
+                await asyncio.sleep(1)
+                if trade.orderStatus.status in ['Filled', 'Cancelled']:
+                    break
             
+            # Get actual filled data
+            filled_qty = trade.orderStatus.filled if hasattr(trade.orderStatus, 'filled') else num_contracts
+            avg_fill_price = trade.orderStatus.avgFillPrice if hasattr(trade.orderStatus, 'avgFillPrice') else limit_price
+            
+            self.trade_logger.info(
+                f"IRON CONDOR {'FILLED' if trade.orderStatus.status == 'Filled' else 'PLACED'} - ID: {trade.order.orderId}\n"
+                f"  Symbol: {symbol}\n"
+                f"  Expiration: {expiration}\n"
+                f"  Put Spread: {put_short_strike}/{put_long_strike}\n"
+                f"  Call Spread: {call_short_strike}/{call_long_strike}\n"
+                f"  Requested: {num_contracts} contracts\n"
+                f"  Filled: {filled_qty} contracts\n"
+                f"  Limit: ${limit_price:.2f}\n"
+                f"  Avg Fill: ${avg_fill_price:.2f}\n"
+                f"  Status: {trade.orderStatus.status}"
+            )
             logger.info(f"✅ Iron Condor placed. Order ID: {trade.order.orderId}")
             
             return {
@@ -239,7 +274,12 @@ class OrderManager:
                 'num_contracts': num_contracts,
                 'limit_price': limit_price,
                 'status': trade.orderStatus.status,
-                'trade': trade
+                'trade': trade,
+                'filled_qty': filled_qty,  # Actual filled
+                'avg_fill_price': avg_fill_price,  # Actual price
+                'requested_qty': num_contracts,  # What was requested
+                'combo_contract': combo,
+                'order': order
             }
             
         except Exception as e:

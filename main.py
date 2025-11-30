@@ -343,6 +343,64 @@ class GeminiTraderAI:
                             'greeks': greeks_data
                         }
                         
+                     # Enhanced Greeks validation with portfolio limits
+                    from validation.greeks_validator import get_greeks_validator
+                    greeks_validator = get_greeks_validator()
+                    greeks_valid = await greeks_validator.validate_greeks(
+                        greeks=greeks_data,
+                        portfolio_delta=0,  # Would fetch from PortfolioRiskManager
+                        regime=regime
+                    )
+                    
+                    if not greeks_valid['valid']:
+                        logger.warning(
+                            f"   ⚠️ Greeks failed validation for {symbol}:\n"
+                            f"      {', '.join(greeks_valid.get('warnings', []))}"
+                        )
+                        continue
+                    
+                    # 🤖 ML: Probability of Touch validation
+                    logger.info(f"\n🤖 ML: Probability of Touch analysis for {symbol}")
+                    
+                    from ml.probability_of_touch import get_pot_predictor
+                    pot_predictor = get_pot_predictor()
+                    
+                    # Check both short strikes (for credit spread or iron condor)
+                    short_strikes = []
+                    for opt in options_data[:2]:  # Check first 2 options
+                        strike = opt.get('strike')
+                        if strike:
+                            short_strikes.append(strike)
+                    
+                    safe_strikes = []
+                    for strike in short_strikes:
+                        # Predict probability of touching this strike before expiration
+                        pot_result = pot_predictor.predict_probability_of_touch(
+                            symbol=symbol,
+                            strike=strike,
+                            current_price=stock_data['price'],
+                            dte=45,  # Assuming 45 DTE
+                            iv=greeks_data.get('impl_vol', 0.30)
+                        )
+                        
+                        pot_prob = pot_result['pot_probability']
+                        
+                        logger.info(
+                            f"   Strike ${strike:.2f}: "
+                            f"PoT = {pot_prob:.1%} "
+                            f"({'✅ SAFE' if pot_prob < 0.30 else '⚠️ RISKY'})"
+                        )
+                        
+                        # Only use strikes with low probability of touch (<30%)
+                        if pot_prob < 0.30:
+                            safe_strikes.append(strike)
+                    
+                    if not safe_strikes:
+                        logger.warning(f"   ⚠️ No safe strikes found for {symbol} (all PoT > 30%)")
+                        continue
+                    
+                    logger.info(f"   ✅ {len(safe_strikes)} safe strike(s) identified via ML")
+                        
                         validation = sanity_checker.validate_recommendation(
                             recommendation=rec_to_validate,
                             options_data=options_data,
