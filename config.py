@@ -139,12 +139,30 @@ class LiquidityThresholds:
     """Liquidity validation thresholds"""
     max_bid_ask_spread: float
     min_volume_oi_ratio: float
+    max_vega: float
     
     @classmethod
     def from_env(cls) -> 'LiquidityThresholds':
         return cls(
             max_bid_ask_spread=float(os.getenv('MAX_BID_ASK_SPREAD', '0.05')),
-            min_volume_oi_ratio=float(os.getenv('MIN_VOLUME_OI_RATIO', '10'))
+            min_volume_oi_ratio=float(os.getenv('MIN_VOLUME_OI_RATIO', '10')),
+            max_vega=float(os.getenv('MAX_VEGA', '0.50'))
+        )
+
+
+@dataclass
+class CircuitBreakerConfig:
+    """Circuit breaker safety thresholds"""
+    daily_max_loss_pct: float  # Max daily loss % before halting
+    consecutive_loss_limit: int  # Number of consecutive losses before halt
+    halt_duration_hours: int  # Auto-reset duration
+    
+    @classmethod
+    def from_env(cls) -> 'CircuitBreakerConfig':
+        return cls(
+            daily_max_loss_pct=float(os.getenv('DAILY_MAX_LOSS_PCT', '5.0')),
+            consecutive_loss_limit=int(os.getenv('CONSECUTIVE_LOSS_LIMIT', '3')),
+            halt_duration_hours=int(os.getenv('HALT_DURATION_HOURS', '24'))
         )
 
 
@@ -194,17 +212,29 @@ class LogConfig:
         )
 
 
+@dataclass
 class Config:
-    """Master configuration object"""
+    """Master configuration container"""
+    ibkr: IBKRConfig
+    ai: AIConfig
+    trading: TradingParams
+    vix: VIXRegimes
+    greeks: GreeksThresholds
+    liquidity: LiquidityThresholds
+    circuit_breaker: CircuitBreakerConfig
+    exit_params: ExitParams
+    safety: SafetyParams
+    logging: LogConfig # Added this field based on the original __init__
     
     def __init__(self):
         self.ibkr = IBKRConfig.from_env()
         self.ai = AIConfig.from_env()
         self.trading = TradingParams.from_env()
-        self.vix_regimes = VIXRegimes.from_env()
+        self.vix = VIXRegimes.from_env()
         self.greeks = GreeksThresholds.from_env()
         self.liquidity = LiquidityThresholds.from_env()
-        self.exit = ExitParams.from_env()
+        self.circuit_breaker = CircuitBreakerConfig.from_env()
+        self.exit_params = ExitParams.from_env()
         self.safety = SafetyParams.from_env()
         self.logging = LogConfig.from_env()
     

@@ -23,6 +23,7 @@ class GeminiTraderAI:
         self.vix_monitor = None
         self.gemini = None
         self.claude = None
+        self.circuit_breaker = None
         self.running = False
     
     async def initialize(self):
@@ -79,6 +80,16 @@ class GeminiTraderAI:
         logger.info("Fetching initial VIX value...")
         await self.vix_monitor.update()
         
+        # Initialize Circuit Breaker
+        logger.info("Initializing Circuit Breaker...")
+        from risk.circuit_breaker import get_circuit_breaker
+        self.circuit_breaker = get_circuit_breaker(
+            daily_max_loss_pct=self.config.circuit_breaker.daily_max_loss_pct,
+            consecutive_loss_limit=self.config.circuit_breaker.consecutive_loss_limit,
+            account_size=account_balance
+        )
+        await self.circuit_breaker.initialize()
+        
         logger.info("=" * 60)
         logger.info("✅ Initialization complete")
         logger.info("=" * 60)
@@ -129,6 +140,17 @@ class GeminiTraderAI:
             logger.info("\n" + "=" * 60)
             logger.info("🚀 STARTING 3-PHASE SCREENING PIPELINE")
             logger.info("=" * 60 + "\n")
+            
+            # 🛑 CIRCUIT BREAKER CHECK
+            if self.circuit_breaker and self.circuit_breaker.is_trading_halted():
+                halt_info = self.circuit_breaker.get_halt_info()
+                logger.error(
+                    f"🛑 CIRCUIT BREAKER ACTIVE - Trading halted\n"
+                    f"   Reason: {halt_info['reason']}\n"
+                    f"   Duration: {halt_info['duration']:.1f}h\n"
+                    f"   Manual reset required!"
+                )
+                return []
             
             # Get current market regime
             await self.vix_monitor.update()
@@ -303,6 +325,38 @@ class GeminiTraderAI:
                     confidence = claude_result.get('confidence_score', 0)
                     decision = claude_result.get('decision', 'REJECT')
                     approved = claude_result.get('approved', False)
+                    
+                    # 🛡️ SANITY CHECK: Validate against real market data
+                    if approved:
+                        from validation.ai_sanity_checker import get_sanity_checker
+                        
+                        sanity_checker = get_sanity_checker()
+                        
+                        # Prepare recommendation for validation
+                        rec_to_validate = {
+                            'symbol': symbol,
+                            'strategy': 'CREDIT_SPREAD',
+                            'option_type': 'CALL',  # TODO: detect from analysis
+                            'short_strike': options_data[0].get('strike'),  # TODO: extract from Claude
+                            'long_strike': options_data[0].get('strike') + 5,  # TODO: extract from Claude
+                            'dte': 45,  # TODO: calculate from expiration
+                            'greeks': greeks_data
+                        }
+                        
+                        validation = sanity_checker.validate_recommendation(
+                            recommendation=rec_to_validate,
+                            options_data=options_data,
+                            current_price=stock_data['price']
+                        )
+                        
+                        if not validation['valid']:
+                            logger.error(
+                                f"❌ AI SANITY CHECK FAILED for {symbol}:\n"
+                                + "\n".join(f"      {err}" for err in validation['errors'])
+                            )
+                            approved = False  # Override approval
+                            decision = 'REJECT'
+                            confidence = 0
                     
                     # Log result with confidence
                     confidence_emoji = "🔥" if confidence >= 9 else "⚠️" if confidence >= 7 else "❌"

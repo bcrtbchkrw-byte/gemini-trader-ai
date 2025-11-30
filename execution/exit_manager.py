@@ -258,6 +258,9 @@ class ExitManager:
             
             # Calculate P/L
             pnl = (entry_credit - exit_price) * contracts * 100
+            # Update position
+            await self.db.execute(
+                """
                 UPDATE positions
                 SET status = 'CLOSED',
                     exit_date = ?,
