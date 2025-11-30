@@ -149,15 +149,17 @@ class ClaudeClient:
         """
         Perform Vanna stress test - simulate IV change impact on Delta
         
-        NOTE: Vanna is the ONLY Greek that AI calculates! 
+        Uses PRECISE Vanna from analytical Black-Scholes calculation.
+        
+        NOTE: Vanna is calculated analytically in data_fetcher.py
         All other Greeks (delta, theta, vega, gamma) come from IBKR API.
         
         Args:
-            options_data: Option Greeks data (delta, theta, vega from IBKR)
+            options_data: Option Greeks data (with precise Vanna)
             iv_change: IV change in percentage points
             
         Returns:
-            Stress test results with vanna calculation
+            Stress test results with precise Vanna calculation
         """
         try:
             current_delta = options_data.get('delta', 0)
@@ -173,9 +175,10 @@ class ClaudeClient:
                     'warning': 'Vanna data not available'
                 }
             
-            # Estimate delta change
-            # dDelta ≈ Vanna * dIV
-            delta_change = vanna * (iv_change / 100)  # Normalize IV change
+            # Calculate delta change using PRECISE Vanna
+            # ΔDelta = Vanna × Δσ
+            # Note: Vanna is ∂Delta/∂σ, so multiply by IV change in decimal
+            delta_change = vanna * (iv_change / 100)  # Convert % to decimal
             new_delta = current_delta + delta_change
             
             # Safety check - Delta should stay under 0.40 for credit spreads
@@ -186,6 +189,7 @@ class ClaudeClient:
                 'current_iv': current_iv,
                 'iv_change': iv_change,
                 'vanna': vanna,
+                'vanna_source': 'analytical_bs',  # Indicate this is precise
                 'delta_change': delta_change,
                 'projected_delta': new_delta,
                 'safe': is_safe,
@@ -193,7 +197,7 @@ class ClaudeClient:
             }
             
             logger.info(
-                f"Vanna stress test: IV +{iv_change}% → "
+                f"Vanna stress test (PRECISE): IV {iv_change:+.0f}% → "
                 f"Delta {current_delta:.3f} → {new_delta:.3f} "
                 f"({'SAFE' if is_safe else 'RISKY'})"
             )

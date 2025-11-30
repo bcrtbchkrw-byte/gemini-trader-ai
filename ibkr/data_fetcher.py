@@ -50,6 +50,72 @@ class IBKRDataFetcher:
             logger.error(f"Error fetching VIX: {e}")
             return None
     
+    async def get_earnings_date(self, symbol: str) -> Optional[datetime]:
+        """
+        Get next earnings date from IBKR fundamental data
+        
+        Uses IBKR's CalendarReport which is more reliable than yfinance.
+        
+        Args:
+            symbol: Stock ticker
+            
+        Returns:
+            Next earnings datetime or None
+        """
+        try:
+            ib = self.connection.get_client()
+            
+            # Create stock contract
+            stock = Stock(symbol, 'SMART', 'USD')
+            await ib.qualifyContractsAsync(stock)
+            
+            # Request fundamental data - CalendarReport contains earnings dates
+            logger.debug(f"Fetching earnings calendar for {symbol} from IBKR...")
+            
+            calendar_xml = await ib.reqFundamentalDataAsync(
+                stock,
+                'CalendarReport'  # Contains earnings dates
+            )
+            
+            if not calendar_xml:
+                logger.debug(f"No calendar data for {symbol}")
+                return None
+            
+            # Parse XML to get earnings date
+            from xml.etree import ElementTree as ET
+            from datetime import datetime
+            
+            root = ET.fromstring(calendar_xml)
+            
+            # Look for earnings announcement date
+            # XML structure: <CalendarReport><EarningsDate>...</EarningsDate></CalendarReport>
+            earnings_elements = root.findall('.//EarningsDate')
+            
+            if not earnings_elements:
+                # Try alternative path
+                earnings_elements = root.findall('.//Event[@Type="Earnings"]')
+            
+            if earnings_elements:
+                # Get the first (next) earnings date
+                earnings_date_str = earnings_elements[0].text
+                
+                if earnings_date_str:
+                    # Parse date (format varies, try common formats)
+                    for fmt in ['%Y-%m-%d', '%Y%m%d', '%m/%d/%Y']:
+                        try:
+                            earnings_date = datetime.strptime(earnings_date_str.strip(), fmt)
+                            logger.info(f"{symbol} next earnings: {earnings_date.strftime('%Y-%m-%d')}")
+                            return earnings_date
+                        except ValueError:
+                            continue
+            
+            logger.debug(f"No earnings date found in calendar for {symbol}")
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Error fetching earnings from IBKR for {symbol}: {e}")
+            return None
+    
     async def get_stock_price(self, symbol: str) -> Optional[float]:
         """
         Get current stock price
@@ -164,7 +230,7 @@ class IBKRDataFetcher:
     
     async def get_option_greeks(self, contract: Contract) -> Optional[Dict[str, Any]]:
         """
-        Get Greeks and other option analytics
+        Get Greeks and other option analytics with PRECISE Vanna calculation
         
         Args:
             contract: Option contract
@@ -184,6 +250,16 @@ class IBKRDataFetcher:
                 ib.cancelMktData(contract)
                 return None
             
+            # Get underlying price for Vanna calculation
+            underlying_price = ticker.last if ticker.last > 0 else ticker.close
+            
+            # Calculate precise Vanna using Black-Scholes
+            vanna = self._calculate_precise_vanna(
+                contract=contract,
+                greeks=ticker.modelGreeks,
+                underlying_price=underlying_price
+            )
+            
             greeks_data = {
                 'symbol': contract.symbol,
                 'strike': contract.strike,
@@ -200,8 +276,7 @@ class IBKRDataFetcher:
                 'theta': ticker.modelGreeks.theta if ticker.modelGreeks else None,
                 'vega': ticker.modelGreeks.vega if ticker.modelGreeks else None,
                 'impl_vol': ticker.modelGreeks.impliedVol if ticker.modelGreeks else None,
-                # Vanna not directly available, need to calculate
-                'vanna': self._estimate_vanna(ticker.modelGreeks) if ticker.modelGreeks else None,
+                'vanna': vanna,  # PRECISE analytical calculation
             }
             
             # Cancel market data
@@ -213,56 +288,99 @@ class IBKRDataFetcher:
             logger.error(f"Error fetching Greeks for {contract}: {e}")
             return None
     
-    def _estimate_vanna(self, greeks) -> Optional[float]:
+    
+    def _calculate_precise_vanna(
+        self,
+        contract: Contract,
+        greeks,
+        underlying_price: float
+    ) -> Optional[float]:
         """
-        Estimate Vanna using conservative Black-Scholes approximation
-        Vanna ≈ Vega * d2 / (S * σ * sqrt(T))
+        Calculate PRECISE Vanna using Black-Scholes analytical formula
         
-        For OTM options (credit spreads), use conservative estimate that
-        scales with Vega and (1-Delta). This UNDERESTIMATES risk, which
-        is safer for credit spreads.
+        Uses full contract details (S, K, T, σ) for accurate calculation.
         
         Args:
-            greeks: Option Greeks from IBKR
+            contract: Option contract with strike, expiration
+            greeks: Model Greeks from IBKR
+            underlying_price: Current underlying price
             
         Returns:
-            Conservative Vanna estimate or None
+            Precise Vanna value or None
         """
-        if not greeks:
+        if not greeks or not underlying_price:
             return None
         
         try:
+            from risk.vanna_calculator import get_vanna_calculator
+            from datetime import datetime
+            
+            # Extract parameters
+            vega = getattr(greeks, 'vega', None)
+            sigma = getattr(greeks, 'impliedVol', None)
+            
+            if vega is None or sigma is None or sigma <= 0:
+                logger.debug("Insufficient data for Vanna calculation")
+                return None
+            
+            # Parse expiration date
+            exp_str = contract.lastTradeDateOrContractMonth
+            exp_date = datetime.strptime(exp_str, '%Y%m%d')
+            
+            # Calculate time to expiration (years)
+            now = datetime.now()
+            T = (exp_date - now).days / 365.0
+            
+            if T <= 0:
+                logger.warning("Option already expired")
+                return None
+            
+            # Get Vanna calculator
+            calc = get_vanna_calculator()
+            
+            # Method 1: Full analytical Black-Scholes (BEST)
+            vanna = calc.calculate_vanna(
+                S=underlying_price,
+                K=contract.strike,
+                T=T,
+                sigma=sigma,
+                option_type='call' if contract.right == 'C' else 'put'
+            )
+            
+            if vanna is not None:
+                logger.debug(
+                    f"Vanna (analytical): {contract.symbol} {contract.strike}{contract.right} "
+                    f"= {vanna:.6f} (S={underlying_price:.2f}, σ={sigma:.2%}, T={T:.3f}y)"
+                )
+                return vanna
+            
+            # Method 2: Fallback - from Vega
+            vanna = calc.calculate_vanna_from_vega(
+                vega=vega,
+                S=underlying_price,
+                K=contract.strike,
+                T=T,
+                sigma=sigma
+            )
+            
+            if vanna is not None:
+                logger.debug(f"Vanna (from Vega): {vanna:.6f}")
+                return vanna
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error calculating precise Vanna: {e}")
+            
+            # Ultimate fallback: conservative estimate
             vega = getattr(greeks, 'vega', None)
             delta = getattr(greeks, 'delta', None)
             
-            if vega is None or delta is None:
-                return None
+            if vega and delta:
+                abs_delta = abs(delta)
+                scaling = 0.35 if 0.15 <= abs_delta <= 0.35 else 0.20
+                return vega * scaling
             
-            # Conservative estimate based on moneyness
-            abs_delta = abs(delta)
-            
-            if abs_delta < 0.10:  # Very OTM (5-10 delta)
-                # Far OTM: very low Vanna
-                vanna_estimate = vega * 0.1
-            elif abs_delta < 0.25:  # Target range for credit spreads (15-25 delta)
-                # Vanna peaks slightly OTM
-                vanna_estimate = vega * 0.3
-            elif abs_delta < 0.50:  # Closer to money
-                # Higher Vanna risk
-                vanna_estimate = vega * 0.5
-            else:  # ITM
-                # ITM options have lower Vanna but high Vega
-                vanna_estimate = vega * 0.4
-            
-            logger.debug(
-                f"Vanna estimate: Delta={abs_delta:.3f}, Vega={vega:.4f}, "
-                f"Vanna={vanna_estimate:.4f}"
-            )
-            
-            return vanna_estimate
-            
-        except Exception as e:
-            logger.error(f"Error estimating Vanna: {e}")
             return None
     
     async def get_bid_ask_spread(self, contract: Contract) -> Optional[float]:

@@ -1,6 +1,6 @@
 """
 Earnings Calendar - Prevent trades near earnings
-Checks earnings dates and blocks trades within blackout window.
+Uses IBKR fundamental data for reliable earnings dates.
 """
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
@@ -8,15 +8,23 @@ from loguru import logger
 
 
 class EarningsChecker:
-    """Check earnings dates and enforce blackout periods"""
+    """Check earnings dates using IBKR fundamental data"""
     
     def __init__(self, blackout_hours: int = 48):
         self.blackout_hours = blackout_hours
         self.cache = {}  # Cache earnings dates
+        self.data_fetcher = None  # Lazy init
     
-    def get_next_earnings(self, symbol: str) -> Optional[datetime]:
+    def _get_data_fetcher(self):
+        """Lazy initialize IBKR data fetcher"""
+        if self.data_fetcher is None:
+            from ibkr.data_fetcher import get_data_fetcher
+            self.data_fetcher = get_data_fetcher()
+        return self.data_fetcher
+    
+    async def get_next_earnings(self, symbol: str) -> Optional[datetime]:
         """
-        Get next earnings date for symbol
+        Get next earnings date from IBKR fundamental data
         
         Args:
             symbol: Stock ticker
@@ -32,43 +40,25 @@ class EarningsChecker:
                 return earnings_date
         
         try:
-            import yfinance as yf
+            fetcher = self._get_data_fetcher()
             
-            ticker = yf.Ticker(symbol)
-            calendar = ticker.calendar
+            # Use IBKR fundamental data (more reliable than yfinance)
+            earnings_date = await fetcher.get_earnings_date(symbol)
             
-            if calendar is None or calendar.empty:
-                logger.debug(f"No earnings calendar for {symbol}")
-                return None
+            if earnings_date:
+                # Cache result
+                self.cache[symbol] = (datetime.now(), earnings_date)
+                logger.info(f"{symbol} next earnings: {earnings_date.strftime('%Y-%m-%d')} (IBKR)")
+                return earnings_date
             
-            # yfinance returns earnings date in calendar
-            if 'Earnings Date' in calendar.index:
-                earnings_value = calendar.loc['Earnings Date']
-                
-                # Handle different return types
-                if isinstance(earnings_value, pd.Series):
-                    # Multiple earnings dates - take first
-                    earnings_date_str = earnings_value.iloc[0]
-                else:
-                    earnings_date_str = earnings_value
-                
-                # Parse earnings date
-                if pd.notna(earnings_date_str):
-                    earnings_date = pd.to_datetime(earnings_date_str)
-                    
-                    # Cache result
-                    self.cache[symbol] = (datetime.now(), earnings_date)
-                    
-                    logger.info(f"{symbol} next earnings: {earnings_date.strftime('%Y-%m-%d')}")
-                    return earnings_date
-            
+            logger.debug(f"No earnings data for {symbol} from IBKR")
             return None
             
         except Exception as e:
             logger.warning(f"Could not fetch earnings for {symbol}: {e}")
             return None
     
-    def is_in_blackout(self, symbol: str) -> Dict[str, Any]:
+    async def is_in_blackout(self, symbol: str) -> Dict[str, Any]:
         """
         Check if symbol is in earnings blackout period
         
@@ -79,7 +69,7 @@ class EarningsChecker:
             Dict with blackout status and details
         """
         try:
-            earnings_date = self.get_next_earnings(symbol)
+            earnings_date = await self.get_next_earnings(symbol)
             
             if earnings_date is None:
                 return {
@@ -135,7 +125,7 @@ class EarningsChecker:
                 'error': str(e)
             }
     
-    def check_batch(self, symbols: list) -> Dict[str, Dict[str, Any]]:
+    async def check_batch(self, symbols: list) -> Dict[str, Dict[str, Any]]:
         """
         Check earnings blackout for multiple symbols
         
@@ -148,7 +138,7 @@ class EarningsChecker:
         results = {}
         
         for symbol in symbols:
-            results[symbol] = self.is_in_blackout(symbol)
+            results[symbol] = await self.is_in_blackout(symbol)
         
         # Log summary
         blocked = [s for s, r in results.items() if r['in_blackout']]
@@ -159,7 +149,7 @@ class EarningsChecker:
         
         return results
     
-    def filter_safe_symbols(self, symbols: list) -> list:
+    async def filter_safe_symbols(self, symbols: list) -> list:
         """
         Filter symbols to only those safe to trade
         
@@ -169,7 +159,7 @@ class EarningsChecker:
         Returns:
             List of symbols NOT in blackout
         """
-        batch_results = self.check_batch(symbols)
+        batch_results = await self.check_batch(symbols)
         safe_symbols = [
             symbol for symbol, result in batch_results.items()
             if not result['in_blackout']

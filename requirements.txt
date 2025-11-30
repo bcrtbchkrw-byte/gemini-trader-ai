@@ -9,7 +9,10 @@ anthropic>=0.18.0
 pandas>=2.0.0
 numpy>=1.24.0
 scipy>=1.11.0
-pandas_ta>=0.3.14b  # Technical Analysis indicators
+pandas_ta>=0.3.14b
+
+# Options Greeks calculation
+py_vollib>=0.3.14b  # Technical Analysis indicators
 
 # Stock Data & News
 yfinance>=0.2.30
