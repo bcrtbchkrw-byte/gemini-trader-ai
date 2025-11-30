@@ -50,6 +50,201 @@ class IBKRDataFetcher:
             logger.error(f"Error fetching VIX: {e}")
             return None
     
+    async def get_beta(self, symbol: str, benchmark: str = 'SPY') -> float:
+        """
+        Get stock beta (correlation with market)
+        
+        Beta measures stock volatility relative to market (SPY).
+        Beta > 1.0 = More volatile than market
+        Beta < 1.0 = Less volatile than market
+        Beta = 1.0 = Moves with market
+        
+        Priority:
+        1. IBKR fundamental data (if available)
+        2. Calculate from historical prices (252 days)
+        3. Fallback to sector average
+        
+        Args:
+            symbol: Stock ticker
+            benchmark: Market benchmark (default: SPY)
+            
+        Returns:
+            Beta value (e.g., 1.2)
+        """
+        try:
+            # Try IBKR fundamental data first
+            beta = await self._get_beta_from_ibkr(symbol)
+            if beta is not None:
+                logger.info(f"Beta for {symbol} from IBKR: {beta:.3f}")
+                return beta
+            
+            # Fallback: Calculate from historical data
+            logger.debug(f"Calculating beta for {symbol} from historical data...")
+            beta = await self._calculate_beta_historical(symbol, benchmark)
+            if beta is not None:
+                logger.info(f"Beta for {symbol} (calculated): {beta:.3f}")
+                return beta
+            
+            # Final fallback: Sector average
+            logger.warning(f"Could not get beta for {symbol}, using sector default")
+            return self._get_sector_beta(symbol)
+            
+        except Exception as e:
+            logger.error(f"Error getting beta for {symbol}: {e}")
+            return 1.0  # Conservative default
+    
+    async def _get_beta_from_ibkr(self, symbol: str) -> Optional[float]:
+        """Get beta from IBKR fundamental data"""
+        try:
+            ib = self.connection.get_client()
+            
+            if not ib or not ib.isConnected():
+                return None
+            
+            from ib_insync import Stock
+            stock = Stock(symbol, 'SMART', 'USD')
+            await ib.qualifyContractsAsync(stock)
+            
+            # Request fundamental data (includes beta)
+            fundamental_xml = await ib.reqFundamentalDataAsync(
+                stock,
+                'ReportsFinSummary'
+            )
+            
+            if not fundamental_xml:
+                return None
+            
+            # Parse beta from XML
+            # Note: XML structure varies, this is simplified
+            import re
+            beta_match = re.search(r'<Beta[^>]*>([0-9.]+)</Beta>', fundamental_xml)
+            if beta_match:
+                return float(beta_match.group(1))
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"IBKR beta fetch failed: {e}")
+            return None
+    
+    async def _calculate_beta_historical(
+        self,
+        symbol: str,
+        benchmark: str = 'SPY',
+        days: int = 252
+    ) -> Optional[float]:
+        """
+        Calculate beta from historical price data
+        
+        Beta = Covariance(stock, market) / Variance(market)
+        
+        Args:
+            symbol: Stock ticker
+            benchmark: Market benchmark
+            days: Historical period (252 = 1 year)
+            
+        Returns:
+            Calculated beta
+        """
+        try:
+            import numpy as np
+            
+            ib = self.connection.get_client()
+            if not ib or not ib.isConnected():
+                return None
+            
+            from ib_insync import Stock
+            from datetime import datetime, timedelta
+            
+            # Get historical data for both stock and benchmark
+            stock = Stock(symbol, 'SMART', 'USD')
+            spy = Stock(benchmark, 'SMART', 'USD')
+            
+            await ib.qualifyContractsAsync(stock, spy)
+            
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=days)
+            
+            # Request historical bars (daily)
+            stock_bars = await ib.reqHistoricalDataAsync(
+                stock,
+                endDateTime=end_date,
+                durationStr=f'{days} D',
+                barSizeSetting='1 day',
+                whatToShow='TRADES',
+                useRTH=True
+            )
+            
+            spy_bars = await ib.reqHistoricalDataAsync(
+                spy,
+                endDateTime=end_date,
+                durationStr=f'{days} D',
+                barSizeSetting='1 day',
+                whatToShow='TRADES',
+                useRTH=True
+            )
+            
+            if not stock_bars or not spy_bars:
+                return None
+            
+            # Calculate returns
+            stock_prices = np.array([bar.close for bar in stock_bars])
+            spy_prices = np.array([bar.close for bar in spy_bars])
+            
+            # Daily returns (percentage change)
+            stock_returns = np.diff(stock_prices) / stock_prices[:-1]
+            spy_returns = np.diff(spy_prices) / spy_prices[:-1]
+            
+            # Ensure same length
+            min_len = min(len(stock_returns), len(spy_returns))
+            stock_returns = stock_returns[-min_len:]
+            spy_returns = spy_returns[-min_len:]
+            
+            # Calculate beta
+            covariance = np.cov(stock_returns, spy_returns)[0][1]
+            variance = np.var(spy_returns)
+            
+            if variance == 0:
+                return None
+            
+            beta = covariance / variance
+            
+            # Sanity check (beta typically -2 to 3)
+            if -2 <= beta <= 3:
+                return beta
+            
+            logger.warning(f"Beta {beta:.3f} outside expected range for {symbol}")
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Beta calculation failed: {e}")
+            return None
+    
+    def _get_sector_beta(self, symbol: str) -> float:
+        """
+        Get default beta based on sector/stock type
+        
+        These are rough averages - better than assuming 1.0
+        """
+        # Tech stocks (high beta)
+        if symbol in ['NVDA', 'AMD', 'TSLA', 'AAPL', 'MSFT', 'GOOGL', 'META']:
+            return 1.3
+        
+        # Utilities (low beta)  
+        if symbol in ['NEE', 'DUK', 'SO', 'D']:
+            return 0.6
+        
+        # Consumer staples (low beta)
+        if symbol in ['PG', 'KO', 'PEP', 'WMT']:
+            return 0.7
+        
+        # Financials (moderate beta)
+        if symbol in ['JPM', 'BAC', 'GS', 'MS']:
+            return 1.1
+        
+        # Default: market beta
+        return 1.0
+
     async def get_earnings_date(self, symbol: str) -> Optional[datetime]:
         """
         Get next earnings date from IBKR fundamental data

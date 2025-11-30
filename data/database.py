@@ -246,6 +246,37 @@ class Database:
             async with db.execute(query, params) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
+    
+    async def get_losing_trades(
+        self,
+        limit: int = 10,
+        days: int = 30
+    ) -> List[Dict[str, Any]]:
+        """
+        Get recent losing trades for analysis
+        
+        Args:
+            limit: Max number of trades to return
+            days: Lookback period in days
+            
+        Returns:
+            List of losing trades
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            
+            query = """
+                SELECT * FROM trades 
+                WHERE status = 'CLOSED' 
+                AND realized_pnl < 0
+                AND close_timestamp >= date('now', ?)
+                ORDER BY realized_pnl ASC
+                LIMIT ?
+            """
+            
+            async with db.execute(query, (f'-{days} days', limit)) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
 
 
 # Singleton instance

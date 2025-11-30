@@ -96,6 +96,23 @@ class GeminiClient:
                 'success': False,
                 'error': str(e)
             }
+            return {
+                'success': False,
+                'error': str(e)
+            }
+            
+    async def generate_response(self, prompt: str) -> str:
+        """
+        Generate a generic response from Gemini
+        
+        Args:
+            prompt: Input prompt
+            
+        Returns:
+            Generated text response
+        """
+        response = await self._generate_async(prompt)
+        return response if response else ""
     
     async def batch_analyze_with_news(
         self,

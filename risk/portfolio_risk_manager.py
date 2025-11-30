@@ -99,22 +99,15 @@ class PortfolioRiskManager:
             return 1.0
         
         try:
-            # Fetch beta from API (simplified - would use real API)
-            # For now, use default sector betas
-            sector_betas = {
-                'AAPL': 1.2,
-                'MSFT': 1.1,
-                'GOOGL': 1.15,
-                'AMZN': 1.3,
-                'NVDA': 1.8,
-                'TSLA': 2.0,
-                'META': 1.4,
-            }
+            # Get actual beta from IBKR
+            from ibkr.data_fetcher import get_data_fetcher
             
-            beta = sector_betas.get(symbol, 1.0)  # Default to 1.0
+            fetcher = get_data_fetcher()
+            beta = await fetcher.get_beta(symbol)
+            
             self.beta_cache[symbol] = beta
             
-            logger.info(f"Beta for {symbol}: {beta:.2f}")
+            logger.debug(f"Beta for {symbol}: {beta:.3f}")
             return beta
             
         except Exception as e:

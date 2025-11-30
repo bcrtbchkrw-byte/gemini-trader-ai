@@ -1,0 +1,74 @@
+# Docker ignore file for Gemini Trader AI
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Virtual environments
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/*.log
+*.log
+
+# Database
+data/*.db
+data/*.db-journal
+
+# Environment
+.env
+.env.local
+
+# Git
+.git/
+.gitignore
+
+# Documentation (build in image)
+docs/
+
+# Tests
+tests/
+test_*.py
+*_test.py
+
+# Development
+*.md
+README.md
+
+# CI/CD
+.github/
+
+# Mac
+.DS_Store
+
+# Temporary files
+*.tmp
+temp/
+tmp/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Pytest
+.pytest_cache/

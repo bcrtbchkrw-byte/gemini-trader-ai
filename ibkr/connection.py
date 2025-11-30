@@ -26,16 +26,35 @@ class IBKRConnection:
         max_retries = 3
         retry_delay = 2
         
-        # Ensure IB instance is initialized
-        if self.ib is None:
-            self.ib = IB()
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error connecting to IBKR: {e}")
-            self._connected = False
-            return False
+        for attempt in range(max_retries):
+            try:
+                if self.ib is None:
+                    self.ib = IB()
+                
+                if not self.ib.isConnected():
+                    logger.info(f"Connecting to IBKR (Attempt {attempt + 1}/{max_retries})...")
+                    await self.ib.connectAsync(
+                        self.config.ibkr.host,
+                        self.config.ibkr.port,
+                        clientId=self.config.ibkr.client_id
+                    )
+                    self._connected = True
+                    logger.info("✅ Connected to IBKR")
+                    
+                    # Verify account
+                    await self._verify_account()
+                    return True
+                
+                return True
+                
+            except Exception as e:
+                logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                else:
+                    logger.error("❌ Failed to connect to IBKR after all retries")
+                    self._connected = False
+                    return False
     
     async def _verify_account(self):
         """Verify account exists and get account summary"""

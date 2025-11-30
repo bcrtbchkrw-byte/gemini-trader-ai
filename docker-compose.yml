@@ -1,38 +1,91 @@
 version: '3.8'
 
 services:
+  # IBKR Gateway
   ib-gateway:
-    image: ghcr.io/voyz/ib_gateway:latest
+    image: ghcr.io/gnzsnz/ib-gateway:latest
     container_name: ib-gateway
-    ports:
-      - "4002:4002"  # Paper trading port
-      - "4001:4001"  # Live trading port
-      - "5900:5900"  # VNC port for GUI access
+    restart: unless-stopped
     environment:
-      # TWS Credentials
       - TWS_USERID=${IBKR_USERNAME}
       - TWS_PASSWORD=${IBKR_PASSWORD}
-      - TRADING_MODE=${TRADING_MODE:-paper}  # paper or live
-      
-      # API Settings
-      - READ_ONLY_API=no
-      
-      # VNC Settings (for remote access)
+      - TRADING_MODE=${TRADING_MODE:-paper}
       - VNC_SERVER_PASSWORD=${VNC_PASSWORD:-password}
-      
-    restart: unless-stopped
-    
-    # Health check
+      - TWOFA_TIMEOUT_ACTION=restart
+    ports:
+      - "4002:4002" # Gateway Paper
+      - "4001:4001" # Gateway Live
+      - "5900:5900" # VNC
+    networks:
+      - trading-network
+    volumes:
+      - ib-gateway-data:/root/Jts
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4002"]
+      test: [ "CMD", "nc", "-z", "localhost", "4002" ]
       interval: 30s
       timeout: 10s
-      retries: 5
+      retries: 3
       start_period: 60s
-    
+
+  # Gemini Trader Bot
+  trader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gemini-trader
+    restart: unless-stopped
+    depends_on:
+      ib-gateway:
+        condition: service_healthy
+    environment:
+      # IBKR Configuration
+      - IBKR_HOST=ib-gateway
+      - IBKR_PORT=${IBKR_PORT:-4002}
+      - IBKR_CLIENT_ID=${IBKR_CLIENT_ID:-1}
+      - IBKR_ACCOUNT=${IBKR_ACCOUNT}
+
+      # AI API Keys
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+
+      # Telegram Notifications
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+
+      # Trading Parameters
+      - MAX_RISK_PER_TRADE=${MAX_RISK_PER_TRADE:-120}
+      - MAX_ALLOCATION_PERCENT=${MAX_ALLOCATION_PERCENT:-25}
+
+      # Risk-Free Rate
+      - RISK_FREE_RATE=${RISK_FREE_RATE:-0.045}
+
+      # Scheduler
+      - AUTO_PREMARKET_SCAN=${AUTO_PREMARKET_SCAN:-true}
+      - PREMARKET_SCAN_TIME=${PREMARKET_SCAN_TIME:-08:45}
+      - ANALYSIS_TIME=${ANALYSIS_TIME:-09:00}
     networks:
-      - trader-network
+      - trading-network
+    volumes:
+      # Persist database and logs
+      - ./data:/app/data
+      - ./logs:/app/logs
+      # Mount .env for local overrides (optional)
+      - ./.env:/app/.env:ro
+    healthcheck:
+      test: [ "CMD-SHELL", "test -f logs/gemini_trader.log && find logs/gemini_trader.log -mmin -5 | grep -q ." ]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.8'
 
 networks:
-  trader-network:
+  trading-network:
     driver: bridge
+
+volumes:
+  ib-gateway-data:

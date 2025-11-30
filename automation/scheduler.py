@@ -132,6 +132,35 @@ class TradingScheduler:
         except Exception as e:
             logger.error(f"Error caching analysis: {e}")
     
+    async def run_weekly_loss_analysis(self):
+        """Run weekly analysis of losing trades"""
+        try:
+            logger.info("🔍 Starting Weekly Loss Analysis...")
+            
+            from analysis.loss_analyzer import get_loss_analyzer
+            from notifications.telegram_notifier import get_telegram_notifier
+            
+            analyzer = get_loss_analyzer()
+            report = await analyzer.analyze_recent_losses(days=7)
+            
+            # Send report via Telegram
+            telegram = get_telegram_notifier()
+            await telegram.send_message(
+                f"📉 *WEEKLY LOSS ANALYSIS*\n\n{report[:3000]}",  # Truncate if too long
+                parse_mode='Markdown'
+            )
+            
+            logger.info("Weekly loss analysis completed and sent.")
+            
+        except Exception as e:
+            logger.error(f"Error in weekly loss analysis: {e}")
+            
+    async def run_premarket_scan(self):
+        """Run premarket scan"""
+        # This method is currently empty as the logic is within run_scheduled_scan
+        # It can be populated if a dedicated premarket scan trigger is needed.
+        pass
+
     async def run_scheduler_loop(self):
         """
         Main scheduler loop
