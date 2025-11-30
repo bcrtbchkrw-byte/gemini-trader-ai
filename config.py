@@ -54,14 +54,14 @@ class AIConfig:
 @dataclass
 class TradingParams:
     """Trading risk and position sizing parameters"""
-    account_size: float
+    account_size: Optional[float]  # Fetched from IBKR API at runtime
     max_risk_per_trade: float
     max_allocation_percent: float
     
     @classmethod
     def from_env(cls) -> 'TradingParams':
         return cls(
-            account_size=float(os.getenv('ACCOUNT_SIZE', '500')),
+            account_size=None,  # Will be fetched from IBKR API
             max_risk_per_trade=float(os.getenv('MAX_RISK_PER_TRADE', '120')),
             max_allocation_percent=float(os.getenv('MAX_ALLOCATION_PERCENT', '25'))
         )
@@ -69,7 +69,13 @@ class TradingParams:
     @property
     def max_position_size(self) -> float:
         """Maximum position size based on allocation percentage"""
+        if self.account_size is None:
+            raise ValueError("Account size not yet fetched from IBKR API")
         return self.account_size * (self.max_allocation_percent / 100)
+    
+    def update_account_size(self, size: float):
+        """Update account size from IBKR API"""
+        self.account_size = size
 
 
 @dataclass
@@ -207,8 +213,10 @@ class Config:
         errors = []
         
         # Validate trading parameters
-        if self.trading.max_risk_per_trade > self.trading.account_size:
-            errors.append("Max risk per trade cannot exceed account size")
+        # Skip account_size validation if not yet fetched from IBKR
+        if self.trading.account_size is not None:
+            if self.trading.max_risk_per_trade > self.trading.account_size:
+                errors.append("Max risk per trade cannot exceed account size")
         
         if self.trading.max_allocation_percent > 100:
             errors.append("Max allocation percent cannot exceed 100%")

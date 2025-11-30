@@ -111,20 +111,20 @@ class ClaudeClient:
     
     async def _generate_async(self, prompt: str) -> Optional[str]:
         """
-        Generate response asynchronously
+        Generate response asynchronously in JSON format
         
         Args:
-            prompt: Input prompt
+            prompt: Input prompt requesting JSON output
             
         Returns:
-            Generated text or None
+            Generated JSON text or None
         """
         try:
-            # Create message
+            # Create message with explicit JSON request
             message = self.client.messages.create(
                 model=self.model,
                 max_tokens=4000,
-                temperature=0.3,  # Lower temperature for more consistent analysis
+                temperature=0.3,  # Lower temperature for consistent structured output
                 messages=[
                     {"role": "user", "content": prompt}
                 ]
@@ -149,12 +149,15 @@ class ClaudeClient:
         """
         Perform Vanna stress test - simulate IV change impact on Delta
         
+        NOTE: Vanna is the ONLY Greek that AI calculates! 
+        All other Greeks (delta, theta, vega, gamma) come from IBKR API.
+        
         Args:
-            options_data: Option Greeks data
+            options_data: Option Greeks data (delta, theta, vega from IBKR)
             iv_change: IV change in percentage points
             
         Returns:
-            Stress test results
+            Stress test results with vanna calculation
         """
         try:
             current_delta = options_data.get('delta', 0)

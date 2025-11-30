@@ -20,9 +20,11 @@ Gemini Trader AI je komplexní systém pro automatizované obchodování opcí s
 - **Earnings Blackout** - 48-hour window před earnings
 
 ### 🤖 AI Integration
-- **Gemini Fundamental Analysis** - Scoring 1-10, sentiment, macro context
-- **Claude Greeks Analysis** - Využívá váš "Gemini-Trader 5.1" systémový prompt
-- **Vanna Risk Modeling** - Simulace Delta expansion při IV spike
+- **Gemini Fundamental Analysis** - JSON output, scoring 1-10, sentiment, macro context
+- **Claude Greeks Analysis** - JSON output with "Gemini-Trader 5.1" systémový prompt
+- **Greeks Data Sources**: 
+  - IBKR API → Delta, Theta, Vega, Gamma (real-time přesná data)
+  - AI výpočet → Pouze Vanna (IV sensitivity modeling)
 - **Structured Decision Logging** - Audit trail všech AI rozhodnutí
 
 ### 📊 Trading Strategies
@@ -74,15 +76,20 @@ nano .env
 ```bash
 # IBKR
 IBKR_HOST=127.0.0.1
-IBKR_PORT=7497  # 7497=TWS Paper, 7496=TWS Live, 4002=Gateway Paper, 4001=Gateway Live
+IBKR_PORT=4002  # 4002=IB Gateway Paper, 4001=IB Gateway Live
 IBKR_ACCOUNT=DU123456  # Váš account number
+
+# IBKR Credentials for Docker IB Gateway
+IBKR_USERNAME=your_ibkr_username
+IBKR_PASSWORD=your_ibkr_password
+TRADING_MODE=paper  # paper or live
+VNC_PASSWORD=password  # For VNC access
 
 # AI API Keys
 GEMINI_API_KEY=your_gemini_api_key_here
 ANTHROPIC_API_KEY=your_anthropic_api_key_here
 
-# Trading
-ACCOUNT_SIZE=500
+# Trading (account balance is fetched from IBKR API)
 MAX_RISK_PER_TRADE=120
 
 # Safety
@@ -90,19 +97,42 @@ PAPER_TRADING=true  # Začněte s paper trading!
 AUTO_EXECUTE=false  # Manual approval doporučeno zpočátku
 ```
 
-### 5. IBKR Setup
+### 5. IBKR Setup (Docker IB Gateway)
 
-**Option A: TWS (Trader Workstation)**
-1. Stáhněte TWS z [IBKR](https://www.interactivebrokers.com/en/trading/tws.php)
-2. Login → Configure → API Settings
-3. Enable "Enable ActiveX and Socket Clients"
-4. Add "127.0.0.1" to Trusted IPs
-5. Port: 7497 (paper) nebo 7496 (live)
+**Docker IB Gateway** (Doporučeno - automatizované, spolehlivé):
 
-**Option B: IB Gateway** (Doporučeno pro Raspberry Pi - lehčí)
-1. Stáhněte IB Gateway
-2. Stejné API settings jako TWS
-3. Port: 4002 (paper) nebo 4001 (live)
+1. **Ujistěte se, že máte Docker nainstalovaný:**
+```bash
+sudo apt-get update
+sudo apt-get install docker.io docker-compose
+sudo usermod -aG docker $USER
+# Logout a znovu login pro refresh skupin
+```
+
+2. **Nakonfigurujte credentials v `.env`:**
+```bash
+IBKR_USERNAME=your_ibkr_username
+IBKR_PASSWORD=your_ibkr_password
+TRADING_MODE=paper  # nebo 'live' pro live trading
+```
+
+3. **Spusťte IB Gateway v Dockeru:**
+```bash
+docker-compose up -d
+```
+
+4. **Ověřte, že běží:**
+```bash
+docker-compose ps
+docker-compose logs -f ib-gateway
+```
+
+5. **Přístup přes VNC (volitelné):**
+- Připojte se k `localhost:5900` s VNC clientem
+- Heslo: hodnota z `VNC_PASSWORD` v `.env`
+- Můžete vidět GUI IB Gateway a zkontrolovat připojení
+
+
 
 ## 💻 Použití
 
@@ -154,6 +184,7 @@ gemini-trader-ai/
 ├── main.py                 # Entry point
 ├── config.py              # Configuration management
 ├── requirements.txt       # Dependencies
+├── docker-compose.yml     # Docker IB Gateway setup
 │
 ├── ibkr/                  # IBKR Integration
 │   ├── connection.py      # Connection manager
@@ -342,7 +373,6 @@ nano .env
 - [ ] Order execution module
 - [ ] Auto exit manager
 - [ ] Strategy builders (Iron Condor, etc.)
-- [ ] Backtesting framework
 - [ ] Performance analytics dashboard
 
 ### Phase 3 (Future)

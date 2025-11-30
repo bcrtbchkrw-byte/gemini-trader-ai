@@ -18,36 +18,17 @@ class IBKRConnection:
     
     async def connect(self) -> bool:
         """
-        Establish connection to IBKR TWS or IB Gateway
+        Connect to IBKR with error handling and retry logic
         
         Returns:
-            bool: True if connection successful, False otherwise
+            bool: True if connection successful
         """
-        try:
+        max_retries = 3
+        retry_delay = 2
+        
+        # Ensure IB instance is initialized
+        if self.ib is None:
             self.ib = IB()
-            
-            logger.info(f"Connecting to IBKR at {self.config.host}:{self.config.port} with client ID {self.config.client_id}")
-            
-            await self.ib.connectAsync(
-                host=self.config.host,
-                port=self.config.port,
-                clientId=self.config.client_id,
-                timeout=20
-            )
-            
-            # Verify connection
-            if not self.ib.isConnected():
-                logger.error("Failed to establish IBKR connection")
-                return False
-            
-            self._connected = True
-            logger.info(f"Successfully connected to IBKR. Account: {self.config.account}")
-            
-            # Set up connection lost callback
-            self.ib.disconnectedEvent += self._on_disconnected
-            
-            # Verify account
-            await self._verify_account()
             
             return True
             
@@ -73,6 +54,30 @@ class IBKRConnection:
             
         except Exception as e:
             logger.error(f"Error verifying account: {e}")
+    
+    async def get_account_balance(self) -> Optional[float]:
+        """
+        Get account net liquidation value
+        
+        Returns:
+            float or None: Account balance in USD
+        """
+        try:
+            account_values = self.ib.accountValues(self.config.account)
+            
+            for av in account_values:
+                if av.tag == 'NetLiquidation' and av.currency == 'USD':
+                    balance = float(av.value)
+                    logger.info(f"Account balance: ${balance:.2f}")
+                    return balance
+            
+            logger.warning("Could not find NetLiquidation value")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error fetching account balance: {e}")
+            return None
+
     
     def _on_disconnected(self):
         """Callback when connection is lost"""

@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  ib-gateway:
+    image: ghcr.io/voyz/ib_gateway:latest
+    container_name: ib-gateway
+    ports:
+      - "4002:4002"  # Paper trading port
+      - "4001:4001"  # Live trading port
+      - "5900:5900"  # VNC port for GUI access
+    environment:
+      # TWS Credentials
+      - TWS_USERID=${IBKR_USERNAME}
+      - TWS_PASSWORD=${IBKR_PASSWORD}
+      - TRADING_MODE=${TRADING_MODE:-paper}  # paper or live
+      
+      # API Settings
+      - READ_ONLY_API=no
+      
+      # VNC Settings (for remote access)
+      - VNC_SERVER_PASSWORD=${VNC_PASSWORD:-password}
+      
+    restart: unless-stopped
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4002"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    
+    networks:
+      - trader-network
+
+networks:
+  trader-network:
+    driver: bridge

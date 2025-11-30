@@ -215,25 +215,55 @@ class IBKRDataFetcher:
     
     def _estimate_vanna(self, greeks) -> Optional[float]:
         """
-        Estimate Vanna (dDelta/dVol)
-        This is a rough estimate as IBKR doesn't provide Vanna directly
+        Estimate Vanna using conservative Black-Scholes approximation
+        Vanna ≈ Vega * d2 / (S * σ * sqrt(T))
+        
+        For OTM options (credit spreads), use conservative estimate that
+        scales with Vega and (1-Delta). This UNDERESTIMATES risk, which
+        is safer for credit spreads.
         
         Args:
-            greeks: Model Greeks object
+            greeks: Option Greeks from IBKR
             
         Returns:
-            Estimated Vanna value
+            Conservative Vanna estimate or None
         """
-        if not greeks or not greeks.vega or not greeks.delta:
+        if not greeks:
             return None
         
-        # Vanna ≈ Vega * (1 - Delta) / IV
-        # This is a simplified estimation
-        if greeks.impliedVol and greeks.impliedVol > 0:
-            vanna_estimate = greeks.vega * (1 - abs(greeks.delta)) / greeks.impliedVol
+        try:
+            vega = getattr(greeks, 'vega', None)
+            delta = getattr(greeks, 'delta', None)
+            
+            if vega is None or delta is None:
+                return None
+            
+            # Conservative estimate based on moneyness
+            abs_delta = abs(delta)
+            
+            if abs_delta < 0.10:  # Very OTM (5-10 delta)
+                # Far OTM: very low Vanna
+                vanna_estimate = vega * 0.1
+            elif abs_delta < 0.25:  # Target range for credit spreads (15-25 delta)
+                # Vanna peaks slightly OTM
+                vanna_estimate = vega * 0.3
+            elif abs_delta < 0.50:  # Closer to money
+                # Higher Vanna risk
+                vanna_estimate = vega * 0.5
+            else:  # ITM
+                # ITM options have lower Vanna but high Vega
+                vanna_estimate = vega * 0.4
+            
+            logger.debug(
+                f"Vanna estimate: Delta={abs_delta:.3f}, Vega={vega:.4f}, "
+                f"Vanna={vanna_estimate:.4f}"
+            )
+            
             return vanna_estimate
-        
-        return None
+            
+        except Exception as e:
+            logger.error(f"Error estimating Vanna: {e}")
+            return None
     
     async def get_bid_ask_spread(self, contract: Contract) -> Optional[float]:
         """

@@ -14,6 +14,7 @@ class GreeksValidator:
     def __init__(self):
         self.config = get_config().greeks
         self.claude = get_claude_client()
+        self.portfolio_greeks = {'delta': 0.0, 'theta': 0.0, 'vega': 0.0, 'gamma': 0.0}
     
     async def validate_credit_spread(
         self,
@@ -74,34 +75,47 @@ class GreeksValidator:
             else:
                 results['issues'].append("Theta not available")
             
-            # Vanna stress test
-            if vanna is not None:
-                vanna_test = await self.claude.stress_test_greeks(
-                    short_leg_greeks,
-                    iv_change=5.0
-                )
+            # Gamma check (NEW)
+            gamma = short_leg_greeks.get('gamma')
+            if gamma is not None:
+                abs_gamma = abs(gamma)
+                max_gamma = self.config.max_gamma if hasattr(self.config, 'max_gamma') else 0.05
                 
-                if vanna_test.get('safe', False):
+                if abs_gamma <= max_gamma:
+                    results['gamma_check'] = True
+                    logger.info(f"✅ Gamma check PASSED: {abs_gamma:.4f}")
+                else:
+                    results['issues'].append(f"Gamma {abs_gamma:.4f} exceeds max {max_gamma}")
+                    logger.warning(f"❌ Gamma check FAILED: {abs_gamma:.4f}")
+            else:
+                results['gamma_check'] = True  # Don't block if unavailable
+            
+            # Enhanced Vanna stress test (multi-scenario)
+            if vanna is not None:
+                vanna_tests = await self._multi_scenario_vanna_test(short_leg_greeks)
+                
+                if vanna_tests['all_safe']:
                     results['vanna_check'] = True
                     logger.info(
                         f"✅ Vanna stress test PASSED: "
-                        f"Delta would move to {vanna_test['projected_delta']:.3f} on +5% IV"
+                        f"All scenarios safe (worst delta: {vanna_tests['worst_delta']:.3f})"
                     )
                 else:
                     results['issues'].append(
-                        vanna_test.get('warning', 'Vanna risk too high')
+                        f"Vanna risk in scenario: {vanna_tests['failed_scenario']}"
                     )
-                    logger.warning(f"❌ Vanna stress test FAILED: {vanna_test.get('warning')}")
+                    logger.warning(f"❌ Vanna stress test FAILED: {vanna_tests['failed_scenario']}")
             else:
                 # If Vanna not available, proceed with caution
                 results['vanna_check'] = True  # Don't block trade
                 logger.warning("⚠️ Vanna not available, proceeding with caution")
             
-            # Overall pass
+            # Overall pass (including gamma)
             results['passed'] = (
                 results['delta_check'] and
                 results['theta_check'] and
-                results['vanna_check']
+                results['vanna_check'] and
+                results.get('gamma_check', True)
             )
             
             return results
@@ -159,6 +173,119 @@ class GreeksValidator:
                 'passed': False,
                 'issues': [f'Validation error: {str(e)}']
             }
+    
+    async def _multi_scenario_vanna_test(
+        self,
+        greeks: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Run Vanna stress test across multiple IV scenarios
+        
+        Args:
+            greeks: Option Greeks
+            
+        Returns:
+            Dict with test results
+        """
+        scenarios = [
+            {'name': 'IV_UP_5', 'iv_change': 5.0},
+            {'name': 'IV_UP_10', 'iv_change': 10.0},
+            {'name': 'IV_DOWN_5', 'iv_change': -5.0},
+        ]
+        
+        results = []
+        worst_delta = 0.0
+        failed_scenario = None
+        
+        for scenario in scenarios:
+            test = await self.claude.stress_test_greeks(
+                greeks,
+                iv_change=scenario['iv_change']
+            )
+            
+            results.append({
+                'scenario': scenario['name'],
+                'iv_change': scenario['iv_change'],
+                'safe': test.get('safe', False),
+                'projected_delta': test.get('projected_delta', 0)
+            })
+            
+            projected_delta = abs(test.get('projected_delta', 0))
+            if projected_delta > abs(worst_delta):
+                worst_delta = test.get('projected_delta', 0)
+            
+            if not test.get('safe', False):
+                failed_scenario = scenario['name']
+        
+        return {
+            'all_safe': failed_scenario is None,
+            'scenarios': results,
+            'worst_delta': worst_delta,
+            'failed_scenario': failed_scenario
+        }
+    
+    def update_portfolio_greeks(
+        self,
+        position_greeks: Dict[str, float],
+        contracts: int,
+        action: str = 'ADD'
+    ):
+        """
+        Update portfolio-level Greeks aggregation
+        
+        Args:
+            position_greeks: Greeks for new position
+            contracts: Number of contracts
+            action: 'ADD' or 'REMOVE'
+        """
+        multiplier = contracts * (1 if action == 'ADD' else -1)
+        
+        for greek in ['delta', 'theta', 'vega', 'gamma']:
+            value = position_greeks.get(greek, 0)
+            self.portfolio_greeks[greek] += value * multiplier
+        
+        logger.info(f"Portfolio Greeks updated ({action}): {self.portfolio_greeks}")
+    
+    def get_portfolio_greeks(self) -> Dict[str, float]:
+        """
+        Get current portfolio-level Greeks
+        
+        Returns:
+            Dict with aggregated Greeks
+        """
+        return self.portfolio_greeks.copy()
+    
+    def check_portfolio_limits(self) -> Dict[str, Any]:
+        """
+        Check if portfolio Greeks are within safe limits
+        
+        Returns:
+            Dict with limit check results
+        """
+        # Define portfolio limits
+        max_portfolio_delta = 1.0  # Max net delta exposure
+        max_portfolio_vega = 10.0  # Max vega exposure
+        
+        results = {
+            'within_limits': True,
+            'issues': []
+        }
+        
+        # Check delta
+        if abs(self.portfolio_greeks['delta']) > max_portfolio_delta:
+            results['within_limits'] = False
+            results['issues'].append(
+                f"Portfolio delta {self.portfolio_greeks['delta']:.2f} exceeds limit {max_portfolio_delta}"
+            )
+        
+        # Check vega
+        if abs(self.portfolio_greeks['vega']) > max_portfolio_vega:
+            results['within_limits'] = False
+            results['issues'].append(
+                f"Portfolio vega {self.portfolio_greeks['vega']:.2f} exceeds limit {max_portfolio_vega}"
+            )
+        
+        return results
 
 
 # Singleton instance

@@ -97,19 +97,96 @@ class GeminiClient:
                 'error': str(e)
             }
     
+    async def batch_analyze_with_news(
+        self,
+        candidates: list,
+        news_context: Dict[str, list],
+        vix: float
+    ) -> Dict[str, Any]:
+        """
+        Phase 2: Batch analyze multiple stocks with news context
+        
+        Args:
+            candidates: List of stock candidates from Phase 1
+            news_context: Dict mapping symbol to news articles
+            vix: Current VIX value
+            
+        Returns:
+            Dict with ranked stocks and top picks
+        """
+        try:
+            from ai.prompts import get_gemini_batch_analysis_prompt
+            
+            logger.info(f"Phase 2: Batch analyzing {len(candidates)} candidates with Gemini...")
+            
+            # Generate batch prompt
+            prompt = get_gemini_batch_analysis_prompt(
+                candidates=candidates,
+                news_context=news_context,
+                vix=vix
+            )
+            
+            # Generate response
+            response = await self._generate_async(prompt)
+            
+            if not response:
+                logger.error("Failed to get batch response from Gemini")
+                return {
+                    'success': False,
+                    'error': 'No response from Gemini'
+                }
+            
+            # Parse response
+            parsed = parse_gemini_response(response)
+            
+            # Extract top picks
+            ranked_stocks = parsed.get('ranked_stocks', [])
+            top_picks = parsed.get('top_picks', [])
+            
+            # Log decision
+            self.ai_logger.info(
+                f"Gemini Batch Analysis\\n"
+                f"Candidates: {len(candidates)}\\n"
+                f"Top Picks: {', '.join(top_picks)}\\n"
+                f"---\\n{response}\\n"
+            )
+            
+            logger.info(
+                f"✅ Phase 2 complete: {len(top_picks)} stocks selected from {len(candidates)} candidates"
+            )
+            
+            return {
+                'success': True,
+                'ranked_stocks': ranked_stocks,
+                'top_picks': top_picks,
+                'raw_response': response
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in Gemini batch analysis: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+
     async def _generate_async(self, prompt: str) -> Optional[str]:
         """
-        Generate response asynchronously
+        Generate response asynchronously with JSON mode
         
         Args:
             prompt: Input prompt
             
         Returns:
-            Generated text or None
+            Generated JSON text or None
         """
         try:
-            # Gemini API is synchronous, but we wrap it for consistency
-            response = self.model.generate_content(prompt)
+            # Use JSON response mode for structured output
+            response = self.model.generate_content(
+                prompt,
+                generation_config=genai.GenerationConfig(
+                    response_mime_type="application/json"
+                )
+            )
             
             if response and response.text:
                 return response.text

@@ -29,13 +29,13 @@ class PositionSizer:
             Dict with position sizing information
         """
         try:
-            # Max risk per contract
+            # Max risk per contract (options are x100 multiplier)
             if credit_received:
                 # Credit spread: risk = width - credit
-                risk_per_contract = (spread_width - credit_received) * 100  # x100 for contract multiplier
+                risk_per_contract = (spread_width - credit_received) * 100
             else:
-                # Debit spread: risk = debit paid (assumed to be spread_width for now)
-                                risk_per_contract = spread_width * 100
+                # Debit spread: risk = debit paid
+                risk_per_contract = spread_width * 100
             
             # Calculate max contracts based on max risk per trade
             if risk_per_contract > 0:
@@ -43,9 +43,15 @@ class PositionSizer:
             else:
                 max_contracts_by_risk = 0
             
-            # Calculate max contracts based on max position size (25% allocation)
-            max_position_value = self.config.max_position_size
+            # Calculate max contracts based on max allocation (25% of account)
+            if self.config.account_size:
+                max_position_value = self.config.account_size * (self.config.max_allocation_percent / 100)
+            else:
+                logger.warning("Account size not set, using risk-only limit")
+                max_position_value = self.config.max_risk_per_trade * 5  # Conservative fallback
+            
             if spread_width > 0:
+                # Each spread ties up max_risk capital (width * 100)
                 max_contracts_by_allocation = int(max_position_value / (spread_width * 100))
             else:
                 max_contracts_by_allocation = 0
