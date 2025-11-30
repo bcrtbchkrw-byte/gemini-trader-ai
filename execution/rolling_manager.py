@@ -145,7 +145,11 @@ class RollingManager:
         proposal: Dict[str, Any]
     ) -> bool:
         """
-        Execute the roll (Atomic: Close Old + Open New)
+        Execute the roll ATOMICALLY using IBKR BAG order
+        
+        This places a single order that simultaneously:
+        1. Closes the old position (BUY to close short, SELL to close long)
+        2. Opens the new position (SELL new short, BUY new long)
         
         Args:
             position: Current position
@@ -154,34 +158,159 @@ class RollingManager:
         Returns:
             True if successful
         """
-        logger.info(f"🔄 EXECUTING ROLL for {position.symbol}...")
+        logger.info(f"🔄 EXECUTING ATOMIC ROLL for {position.symbol}...")
         
-        # 1. Close current position
-        # In a real implementation, this would be a single COMBO order (Close + Open)
-        # For now, we simulate it as Close then Open to keep it simple, 
-        # but acknowledge the slippage risk.
-        
-        # Ideally: self.ibkr.place_combo_order(close_legs + open_legs)
-        
-        close_result = await self.exit_manager.place_closing_order(
-            position={'id': position.position_id, 'symbol': position.symbol, 'strategy': position.strategy},
-            reason=f"Rolling: {proposal['roll_type']}"
-        )
-        
-        if not close_result or close_result['status'] != 'FILLED':
-            logger.error("❌ Roll failed: Could not close existing position")
-            return False
+        try:
+            # Get original legs
+            short_legs = [l for l in position.legs if l['action'] == 'SELL']
+            long_legs = [l for l in position.legs if l['action'] == 'BUY']
             
-        # 2. Open new position
-        # This would be triggered via the Strategy Selector or manually constructed here
-        # For this MVP, we'll just log that the new position should be opened.
-        
-        logger.info(f"✅ Old position closed. OPENING NEW POSITION per proposal: {proposal}")
-        
-        # TODO: Call StrategyExecutor to open the new legs
-        # await self.strategy_executor.execute_strategy(...)
-        
-        return True
+            if not short_legs or not long_legs:
+                logger.error("❌ Cannot roll: position must have both short and long legs")
+                return False
+            
+            short_leg = short_legs[0]
+            long_leg = long_legs[0]
+            
+            # Calculate current width
+            width = abs(long_leg['strike'] - short_leg['strike'])
+            
+            # Determine new strikes based on roll type
+            if proposal['roll_type'] == 'ROLL_UP_AND_OUT':
+                # Move call strikes up (tested side is calls)
+                new_short_strike = short_leg['strike'] + width  # Move up one width
+                new_long_strike = new_short_strike + width
+            elif proposal['roll_type'] == 'ROLL_DOWN_AND_OUT':
+                # Move put strikes down (tested side is puts)
+                new_short_strike = short_leg['strike'] - width  # Move down one width
+                new_long_strike = new_short_strike - width
+            else:
+                # Standard roll out - keep strikes same
+                new_short_strike = short_leg['strike']
+                new_long_strike = long_leg['strike']
+            
+            # Get IBKR connection
+            from ibkr.connection import get_ibkr_connection
+            from ib_insync import Contract, ComboLeg, LimitOrder, Option
+            
+            ibkr = get_ibkr_connection()
+            ib = ibkr.get_client()
+            
+            if not ib or not ibkr.is_connected():
+                logger.error("❌ Not connected to IBKR")
+                return False
+            
+            # Create option contracts for OLD position (to close)
+            old_short = Option(
+                position.symbol,
+                position.expiration.strftime('%Y%m%d'),
+                short_leg['strike'],
+                short_leg['option_type'][0],  # 'C' or 'P'
+                'SMART'
+            )
+            old_long = Option(
+                position.symbol,
+                position.expiration.strftime('%Y%m%d'),
+                long_leg['strike'],
+                long_leg['option_type'][0],
+                'SMART'
+            )
+            
+            # Create option contracts for NEW position (to open)
+            new_exp_date = datetime.strptime(proposal['new_expiration'], '%Y-%m-%d').strftime('%Y%m%d')
+            new_short = Option(
+                position.symbol,
+                new_exp_date,
+                new_short_strike,
+                short_leg['option_type'][0],
+                'SMART'
+            )
+            new_long = Option(
+                position.symbol,
+                new_exp_date,
+                new_long_strike,
+                long_leg['option_type'][0],
+                'SMART'
+            )
+            
+            # Qualify all contracts
+            logger.info("📋 Qualifying option contracts...")
+            await ib.qualifyContractsAsync(old_short, old_long, new_short, new_long)
+            
+            # Create BAG order with 4 legs
+            bag = Contract()
+            bag.symbol = position.symbol
+            bag.secType = 'BAG'
+            bag.currency = 'USD'
+            bag.exchange = 'SMART'
+            
+            # Legs: Close old + Open new
+            bag.comboLegs = [
+                # Close old position (reverse of original)
+                ComboLeg(conId=old_short.conId, ratio=1, action='BUY', exchange='SMART'),   # BUY to close short
+                ComboLeg(conId=old_long.conId, ratio=1, action='SELL', exchange='SMART'),  # SELL to close long
+                # Open new position
+                ComboLeg(conId=new_short.conId, ratio=1, action='SELL', exchange='SMART'), # SELL new short
+                ComboLeg(conId=new_long.conId, ratio=1, action='BUY', exchange='SMART'),   # BUY new long
+            ]
+            
+            # Calculate limit price (aim for small credit or break-even)
+            # For now, set to -0.05 (willing to pay $5 to roll if needed)
+            roll_limit = -0.05
+            
+            # Create limit order
+            order = LimitOrder(
+                action='BUY',  # BUY the combo
+                totalQuantity=position.contracts,
+                lmtPrice=roll_limit,
+                tif='DAY',
+                orderType='LMT'
+            )
+            
+            logger.info(
+                f"📤 Placing ATOMIC ROLL order:\n"
+                f"   Close OLD: {short_leg['strike']}/{long_leg['strike']} exp {position.expiration.date()}\n"
+                f"   Open NEW: {new_short_strike}/{new_long_strike} exp {proposal['new_expiration']}\n"
+                f"   Limit: ${roll_limit:.2f} (per spread)\n"
+                f"   Contracts: {position.contracts}"
+            )
+            
+            # Place order
+            trade = ib.placeOrder(bag, order)
+            
+            logger.info(f"✅ ROLL order placed. Order ID: {trade.order.orderId}")
+            logger.info(f"   Status: {trade.orderStatus.status}")
+            
+            # Wait for fill (with timeout)
+            import asyncio
+            for _ in range(30):  # 30 seconds timeout
+                await asyncio.sleep(1)
+                if trade.orderStatus.status in ['Filled', 'Cancelled']:
+                    break
+            
+            if trade.orderStatus.status == 'Filled':
+                logger.info(f"🎉 ROLL EXECUTED for {position.symbol}!")
+                logger.info(f"   Fill price: ${trade.orderStatus.avgFillPrice:.2f}")
+                
+                # TODO: Update database with new position
+                # - Mark old position as ROLLED
+                # - Create new position entry
+                
+                return True
+            else:
+                logger.warning(f"⏱️ Roll order not filled yet. Status: {trade.orderStatus.status}")
+                logger.warning(f"   Monitor order ID: {trade.order.orderId}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Error executing roll: {e}")
+            logger.critical(
+                f"🚨 CRITICAL ERROR during roll execution!\n"
+                f"   Symbol: {position.symbol}\n"
+                f"   Error: {str(e)}\n"
+                f"   Manual intervention required!"
+            )
+            return False
 
 
 # Singleton

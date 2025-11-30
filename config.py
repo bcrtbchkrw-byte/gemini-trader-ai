@@ -181,6 +181,20 @@ class ExitParams:
 
 
 @dataclass
+class OrderTTLConfig:
+    """Order time-to-live configuration"""
+    ttl_minutes: int
+    cleanup_interval_minutes: int
+    
+    @classmethod
+    def from_env(cls) -> 'OrderTTLConfig':
+        return cls(
+            ttl_minutes=int(os.getenv('ORDER_TTL_MINUTES', '30')),
+            cleanup_interval_minutes=int(os.getenv('ORDER_CLEANUP_INTERVAL', '5'))
+        )
+
+
+@dataclass
 class SafetyParams:
     """Safety and risk control parameters"""
     earnings_blackout_hours: int
@@ -222,6 +236,7 @@ class Config:
     greeks: GreeksThresholds
     liquidity: LiquidityThresholds
     circuit_breaker: CircuitBreakerConfig
+    order_ttl: OrderTTLConfig
     exit_params: ExitParams
     safety: SafetyParams
     logging: LogConfig # Added this field based on the original __init__
@@ -234,6 +249,7 @@ class Config:
         self.greeks = GreeksThresholds.from_env()
         self.liquidity = LiquidityThresholds.from_env()
         self.circuit_breaker = CircuitBreakerConfig.from_env()
+        self.order_ttl = OrderTTLConfig.from_env()
         self.exit_params = ExitParams.from_env()
         self.safety = SafetyParams.from_env()
         self.logging = LogConfig.from_env()

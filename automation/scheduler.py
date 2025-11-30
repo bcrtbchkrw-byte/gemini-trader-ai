@@ -199,18 +199,57 @@ class TradingScheduler:
             except Exception as e:
                 logger.error(f"Scheduler loop error: {e}")
                 await asyncio.sleep(60)
+            except Exception as e:
+                logger.error(f"Error in scheduled scan: {e}")
+                await asyncio.sleep(300)  # Wait 5 min before retry
     
-    def stop(self):
-        """Stop scheduler"""
-        self.running = False
-        logger.info("Scheduler stopped")
+    async def cleanup_stale_orders_loop(self):
+        """
+        Periodically cancel orders older than TTL threshold
+        
+        Runs every cleanup_interval_minutes during market hours
+        """
+        from ibkr.order_manager import get_order_manager
+        from config import get_config
+        
+        config = get_config()
+        order_manager = get_order_manager()
+        
+        ttl_minutes = config.order_ttl.ttl_minutes
+        cleanup_interval = config.order_ttl.cleanup_interval_minutes
+        
+        logger.info(
+            f"🗑️ Order TTL cleanup enabled: cancel orders older than {ttl_minutes} min, "
+            f"checking every {cleanup_interval} min"
+        )
+        
+        while self.running:
+            try:
+                # Only run during market hours
+                now = datetime.now().time()
+                market_open = time(9, 30)
+                market_close = time(16, 0)
+                
+                if market_open <= now <= market_close:
+                    logger.debug("🔍 Running stale order cleanup...")
+                    cancelled = await order_manager.cancel_stale_orders(ttl_minutes)
+                    
+                    if cancelled > 0:
+                        logger.warning(f"🗑️ Cancelled {cancelled} stale order(s)")
+                
+                # Wait for next cleanup interval
+                await asyncio.sleep(cleanup_interval * 60)
+                
+            except Exception as e:
+                logger.error(f"Error in order cleanup: {e}")
+                await asyncio.sleep(60)  # Wait 1 min before retry
 
 
 # Singleton
 _scheduler: Optional[TradingScheduler] = None
 
 
-def get_scheduler() -> TradingScheduler:
+def get_trading_scheduler() -> TradingScheduler:
     """Get or create singleton scheduler"""
     global _scheduler
     if _scheduler is None:
