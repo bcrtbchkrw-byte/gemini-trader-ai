@@ -158,6 +158,47 @@ class GeminiTraderAI:
             logger.info(f"✅ Phase 1 Complete: {len(candidates)} candidates selected\n")
             
             # =============================================================
+            # PHASE 1.5: EARNINGS FILTER (Filter BEFORE expensive AI calls)
+            # =============================================================
+            logger.info("=" * 60)
+            logger.info("📅 PHASE 1.5: EARNINGS BLACKOUT FILTER")
+            logger.info("=" * 60)
+            
+            from analysis.earnings_checker import get_earnings_checker
+            
+            earnings_checker = get_earnings_checker()
+            symbols = [c['symbol'] for c in candidates]
+            
+            # Filter out symbols in earnings blackout window
+            safe_symbols = await earnings_checker.filter_safe_symbols(symbols)
+            
+            filtered_candidates = [
+                c for c in candidates
+                if c['symbol'] in safe_symbols
+            ]
+            
+            blacklisted_count = len(candidates) - len(filtered_candidates)
+            
+            if blacklisted_count > 0:
+                blacklisted_symbols = [
+                    c['symbol'] for c in candidates
+                    if c['symbol'] not in safe_symbols
+                ]
+                logger.warning(
+                    f"⚠️  Filtered {blacklisted_count} stocks in earnings blackout: "
+                    f"{', '.join(blacklisted_symbols)}"
+                )
+            
+            logger.info(f"✅ {len(filtered_candidates)} stocks passed earnings filter\n")
+            
+            if not filtered_candidates:
+                logger.warning("No stocks passed earnings filter - pipeline stopped")
+                return []
+            
+            # Use filtered candidates for Gemini analysis
+            candidates = filtered_candidates
+            
+            # =============================================================
             # PHASE 2: GEMINI FUNDAMENTAL ANALYSIS
             # =============================================================
             logger.info("🤖 PHASE 2: Gemini Fundamental Analysis + News")
@@ -232,30 +273,55 @@ class GeminiTraderAI:
                         logger.warning(f"   ⚠️  No suitable options found for {symbol}")
                         continue
                     
-                    # Claude strategy recommendation
-                    claude_result = await self.claude.analyze_greeks_and_recommend(
-                        symbol=symbol,
-                        options_data=options_data,
-                        vix=vix,
-                        regime=regime
+                    # Prepare stock data for Claude
+                    stock_data = {
+                        'symbol': symbol,
+                        'price': options_data[0].get('stock_price', 0),
+                        'iv_rank': options_data[0].get('iv_rank', 50),
+                        'volume': options_data[0].get('volume', 0),
+                        'sector': 'Unknown'  # TODO: Fetch from data_fetcher
+                    }
+                    
+                    # Use first option's Greeks (or aggregate if multiple)
+                    greeks_data = {
+                        'delta': options_data[0].get('delta', 0),
+                        'gamma': options_data[0].get('gamma', 0),
+                        'theta': options_data[0].get('theta', 0),
+                        'vega': options_data[0].get('vega', 0),
+                        'vanna': options_data[0].get('vanna', 0),
+                        'impl_vol': options_data[0].get('impliedVolatility', 0),
+                    }
+                    
+                    # Claude strategy analysis with confidence scoring
+                    claude_result = await self.claude.analyze_strategy(
+                        stock_data=stock_data,
+                        options_data=greeks_data,
+                        strategy_type="CREDIT_SPREAD"  # Or detect from options_data
                     )
                     
-                    if claude_result['success']:
-                        recommendation = claude_result['recommendation']
-                        verdict = recommendation.get('verdict', 'UNKNOWN')
-                        strategy = recommendation.get('strategy', 'N/A')
-                        
-                        verdict_emoji = "✅" if verdict == "SCHVÁLENO" else "❌"
-                        logger.info(f"   {verdict_emoji} {verdict} - {strategy}\n")
-                        
+                    # Extract confidence and decision
+                    confidence = claude_result.get('confidence_score', 0)
+                    decision = claude_result.get('decision', 'REJECT')
+                    approved = claude_result.get('approved', False)
+                    
+                    # Log result with confidence
+                    confidence_emoji = "🔥" if confidence >= 9 else "⚠️" if confidence >= 7 else "❌"
+                    logger.info(
+                        f"   {confidence_emoji} Confidence: {confidence}/10 - {decision}"
+                    )
+                    
+                    if approved:
+                        logger.info(f"   ✅ APPROVED - High conviction trade\n")
                         recommendations.append({
                             'symbol': symbol,
-                            'verdict': verdict,
-                            'recommendation': recommendation,
+                            'verdict': 'SCHVÁLENO',
+                            'confidence': confidence,
+                            'recommendation': claude_result,
                             'options_data': options_data
                         })
                     else:
-                        logger.warning(f"   ⚠️  Claude analysis failed: {claude_result.get('error')}\n")
+                        reason = claude_result.get('reasoning', 'Low confidence')
+                        logger.info(f"   ❌ REJECTED - {reason}\n")
                         
                 except Exception as e:
                     logger.error(f"   ❌ Error analyzing {symbol}: {e}\n")
@@ -267,20 +333,23 @@ class GeminiTraderAI:
             logger.info("=" * 60)
             logger.info("✅ 3-PHASE PIPELINE COMPLETE")
             logger.info("=" * 60)
-            logger.info(f"Phase 1 (Pre-check):     {len(candidates)} candidates")
+            logger.info(f"Phase 1 (Pre-check):     {len(candidates) + blacklisted_count} candidates")
+            logger.info(f"Phase 1.5 (Earnings):    {blacklisted_count} filtered (blackout)")
             logger.info(f"Phase 2 (Gemini):        {len(top_picks)} winners")
             logger.info(f"Phase 3 (Claude):        {len(recommendations)} strategies")
             logger.info("=" * 60 + "\n")
             
-            # Display approved trades
+            # Display approved trades with confidence scores
             approved = [r for r in recommendations if r['verdict'] == 'SCHVÁLENO']
             if approved:
-                logger.info(f"✅ {len(approved)} APPROVED TRADES:")
+                logger.info(f"✅ {len(approved)} APPROVED TRADES (Confidence >= 9/10):")
                 for rec in approved:
-                    logger.info(f"   🎯 {rec['symbol']} - {rec['recommendation'].get('strategy', 'N/A')}")
+                    conf = rec.get('confidence', 0)
+                    strat = rec['recommendation'].get('strategy', 'N/A')
+                    logger.info(f"   🎯 {rec['symbol']} - {strat} (Confidence: {conf}/10)")
                 logger.info("")
             else:
-                logger.info("⚠️  No trades approved by Claude")
+                logger.info("⚠️  No trades approved by Claude (all below 9/10 confidence threshold)")
             
             return recommendations
             
