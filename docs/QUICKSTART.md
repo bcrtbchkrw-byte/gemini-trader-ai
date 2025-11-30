@@ -1,159 +1,136 @@
-# Gemini Trader AI - Quick Start Guide
+# Quick Start - Installation Guide
 
-## 🎯 Spouštění
+## 📦 Installation
 
-### 1. Jednorázové spuštění (manuální)
+### 1. Clone & Setup
 ```bash
-python main.py
-```
-- Spustí 3-phase pipeline
-- Jednorázová analýza
-- Bez automatizace
-
-### 2. Auto-scheduler (doporučeno)
-```bash
-# V .env nastav:
-AUTO_PREMARKET_SCAN=true
-
-# Pak spusť:
-python main.py
-```
-- **8:45 AM**: Premarket scan (najde movers)
-- **9:00 AM**: AI analýza top picks
-- Výsledky cached celý den
-
-### 3. Continuous Scheduler (daemon)
-```bash
-./run_scheduler.sh
-
-# Nebo přímo:
-python main.py --scheduler
-```
-- Běží celý den
-- 8:45 AM - premarket scan
-- 9:00 AM - AI analýza
-- Pak monitoruje cache
-
----
-
-## ⚙️ Konfigurace (.env)
-
-```bash
-# Scheduler
-AUTO_PREMARKET_SCAN=true
-PREMARKET_SCAN_TIME=08:45
-ANALYSIS_TIME=09:00
-PREMARKET_MAX_CANDIDATES=15
-```
-
----
-
-## 📊 Workflow Comparison
-
-### Bez Scheduleru (velké náklady)
-```
-10:00 → AI call
-10:10 → AI call  
-10:20 → AI call
-...
-16:00 → AI call
-
-= 48 AI calls/den = ~$1.50
-```
-
-### Se Schedulerem (úspora 97%)
-```
-8:45 → Premarket scan (FREE)
-9:00 → 1x AI call na top picks
-Rest of day → používá cache
-
-= 1 AI call/den = ~$0.05
-```
-
----
-
-## 🎯 Příklady použití
-
-### Ranní workflow
-```bash
-# 1. Ráno spusť scheduler
-./run_scheduler.sh
-
-# 2. V 8:45 - automatický premarket scan
-# 3. V 9:00 - AI analýza
-# 4. Výsledky v data/premarket_candidates.json
-```
-
-### API přístup k výsledkům
-```python
-from automation.premarket_scanner import get_premarket_scanner
-
-scanner = get_premarket_scanner()
-
-# Get cached candidates (celý den)
-candidates = scanner.get_cached_candidates()
-
-# Get top picks
-top_5 = scanner.get_top_picks(5)
-```
-
----
-
-## 🔍 Co hledá Premarket Scanner
-
-**Metriky:**
-- Gap > 2% (50 bodů) nebo > 4% (30 bodů)
-- Volume ratio > 2x (30 bodů)
-- High volatility (20 bodů)
-
-**Výstup:**
-```json
-{
-  "symbol": "AAPL",
-  "score": 80,
-  "gap_pct": 3.5,
-  "volume_ratio": 2.8,
-  "reasons": ["GAP_3.5%", "HIGH_VOLUME", "VOLATILE"]
-}
-```
-
----
-
-## 💰 Úspora nákladů
-
-| Metoda | AI Calls | Náklady/den |
-|--------|----------|-------------|
-| Bez scheduleru | 48 | ~$1.50 |
-| Se schedulerem | 1 | ~$0.05 |
-| **Úspora** | **97%** | **$1.45** |
-
----
-
-## 🚀 Production Deployment
-
-### Na Raspberry Pi
-```bash
-# 1. Clone repo
-git clone ...
+git clone <repo-url>
 cd gemini-trader-ai
-
-# 2. Setup
 ./setup.sh
+```
 
-# 3. Configure
+**What setup.sh does:**
+- Creates/activates virtual environment
+- Installs all dependencies from requirements.txt
+- **Runs dependency check automatically**
+- Verifies scipy and VannaCalculator work
+
+### 2. Manual Installation
+```bash
+# Create venv
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Verify installation
+python check_dependencies.py
+```
+
+### 3. Expected Output
+```
+============================================================
+✅ scipy                  1.11.4
+✅ numpy                  1.24.3
+✅ pandas                 2.0.3
+... (all packages)
+
+Installed: 12/12
+
+Critical Component Tests:
+✅ scipy: scipy working (norm.pdf(0) = 0.3989)
+✅ VannaCalculator: VannaCalculator working
+
+============================================================
+✅ All dependencies OK - System ready!
+```
+
+## ⚠️ If Dependencies Missing
+
+**Error:**
+```
+❌ scipy                     MISSING
+❌ Dependency check FAILED
+```
+
+**Fix:**
+```bash
+pip install -r requirements.txt
+
+# Or specific package:
+pip install scipy numpy
+```
+
+## 🔧 Configuration
+
+### 1. Create .env file
+```bash
 cp .env.example .env
 nano .env
-
-# 4. Run as service
-sudo systemctl enable gemini-trader
-sudo systemctl start gemini-trader
 ```
 
-### Docker
+### 2. Add API keys
 ```bash
-docker-compose up -d
+GEMINI_API_KEY=your_key_here
+ANTHROPIC_API_KEY=your_key_here
+NEWS_API_KEY=your_key_here
+
+# IBKR connection
+IBKR_HOST=127.0.0.1
+IBKR_PORT=7497
+IBKR_CLIENT_ID=1
 ```
+
+## ✅ Verify Installation
+
+```bash
+# Check all dependencies
+python check_dependencies.py
+
+# Should show:
+# ✅ All dependencies OK - System ready!
+```
+
+## 🚀 Run
+
+### Auto-Scheduler (Recommended)
+```bash
+# Set in .env:
+AUTO_PREMARKET_SCAN=true
+
+# Run:
+python main.py
+```
+
+### Continuous Daemon
+```bash
+./run_scheduler.sh
+```
+
+### Manual Mode
+```bash
+# Set in .env:
+AUTO_PREMARKET_SCAN=false
+
+# Run:
+python main.py
+```
+
+## 📝 Critical Dependencies
+
+**For Vanna Calculation:**
+- scipy >= 1.11.0 ⚠️ REQUIRED
+- numpy >= 1.24.0 ⚠️ REQUIRED
+- py_vollib (optional, but recommended)
+
+**For Trading:**
+- ib_insync
+- google-generativeai
+- anthropic
+
+**Verified by:** `check_dependencies.py`
 
 ---
 
-**Tip:** Pro maximální úsporu používej scheduler + cache celý den!
+**Status:** Setup script will fail if dependencies missing ✅

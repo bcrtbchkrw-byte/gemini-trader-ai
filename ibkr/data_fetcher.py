@@ -54,7 +54,8 @@ class IBKRDataFetcher:
         """
         Get next earnings date from IBKR fundamental data
         
-        Uses IBKR's CalendarReport which is more reliable than yfinance.
+        Uses IBKR's CalendarReport with rate limiting to avoid pacing violations.
+        IBKR limit: ~60 fundamental data requests per 10 minutes.
         
         Args:
             symbol: Stock ticker
@@ -62,6 +63,8 @@ class IBKRDataFetcher:
         Returns:
             Next earnings datetime or None
         """
+        import asyncio
+        
         try:
             ib = self.connection.get_client()
             
@@ -69,13 +72,44 @@ class IBKRDataFetcher:
             stock = Stock(symbol, 'SMART', 'USD')
             await ib.qualifyContractsAsync(stock)
             
-            # Request fundamental data - CalendarReport contains earnings dates
+            # Request fundamental data with retry logic for pacing violations
             logger.debug(f"Fetching earnings calendar for {symbol} from IBKR...")
             
-            calendar_xml = await ib.reqFundamentalDataAsync(
-                stock,
-                'CalendarReport'  # Contains earnings dates
-            )
+            max_retries = 3
+            retry_delay = 5  # Start with 5 seconds
+            
+            for attempt in range(max_retries):
+                try:
+                    # Add small delay to avoid pacing violations (error 162)
+                    if attempt > 0:
+                        logger.info(f"Retry {attempt}/{max_retries} for {symbol} after {retry_delay}s")
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    
+                    calendar_xml = await ib.reqFundamentalDataAsync(
+                        stock,
+                        'CalendarReport'  # Contains earnings dates
+                    )
+                    
+                    # Success - break retry loop
+                    break
+                    
+                except Exception as e:
+                    error_msg = str(e)
+                    
+                    # Check for pacing violation (error 162)
+                    if '162' in error_msg or 'pacing' in error_msg.lower():
+                        logger.warning(
+                            f"IBKR pacing violation for {symbol} (attempt {attempt+1}/{max_retries}). "
+                            f"Waiting {retry_delay}s..."
+                        )
+                        if attempt == max_retries - 1:
+                            logger.error(f"Failed to get earnings for {symbol} after {max_retries} retries")
+                            return None
+                        continue
+                    else:
+                        # Different error - raise it
+                        raise
             
             if not calendar_xml:
                 logger.debug(f"No calendar data for {symbol}")

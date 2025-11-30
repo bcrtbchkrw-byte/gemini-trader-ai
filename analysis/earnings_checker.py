@@ -125,19 +125,34 @@ class EarningsChecker:
                 'error': str(e)
             }
     
-    async def check_batch(self, symbols: list) -> Dict[str, Dict[str, Any]]:
+    async def check_batch(self, symbols: list, delay_seconds: float = 2.0) -> Dict[str, Dict[str, Any]]:
         """
-        Check earnings blackout for multiple symbols
+        Check earnings blackout for multiple symbols with rate limiting
+        
+        IBKR has strict limits on fundamental data:
+        - ~60 requests per 10 minutes
+        - Pacing violation error 162 if exceeded
         
         Args:
             symbols: List of stock tickers
+            delay_seconds: Delay between requests (default 2s = 30 req/min, safe)
             
         Returns:
             Dict of symbol -> blackout status
         """
-        results = {}
+        import asyncio
         
-        for symbol in symbols:
+        results = {}
+        total = len(symbols)
+        
+        logger.info(f"Checking earnings for {total} symbols (throttled @ {delay_seconds}s delay)...")
+        
+        for i, symbol in enumerate(symbols, 1):
+            # Add delay between requests to avoid pacing violations
+            if i > 1:  # Skip delay on first request
+                await asyncio.sleep(delay_seconds)
+            
+            logger.debug(f"[{i}/{total}] Checking {symbol}...")
             results[symbol] = await self.is_in_blackout(symbol)
         
         # Log summary
@@ -146,6 +161,10 @@ class EarningsChecker:
             logger.warning(f"⚠️  {len(blocked)} symbols in earnings blackout: {', '.join(blocked)}")
         else:
             logger.info(f"✅ All {len(symbols)} symbols clear of earnings")
+        
+        # Log rate info
+        total_time = delay_seconds * (total - 1)
+        logger.info(f"Batch complete: {total} symbols in {total_time:.1f}s (rate-limited)")
         
         return results
     

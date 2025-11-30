@@ -17,6 +17,17 @@ echo "📦 Installing dependencies..."
 pip install --upgrade pip
 pip install -r requirements.txt
 
+echo ""
+echo "🔍 Checking dependencies..."
+python check_dependencies.py
+
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "❌ Dependency check failed!"
+    echo "Please fix the issues above before running."
+    exit 1
+fi
+
 echo "✅ Setup complete!"
 echo ""
 echo "To run tests:"
