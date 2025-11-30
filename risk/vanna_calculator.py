@@ -14,26 +14,33 @@ class VannaCalculator:
     
     Vanna measures sensitivity of Delta to changes in volatility.
     Critical for stress testing options strategies.
+    
+    Now uses DYNAMIC risk-free rate from IBKR Treasury yields.
     """
     
-    def __init__(self, risk_free_rate: Optional[float] = None):
+    def __init__(self, risk_free_rate: Optional[float] = None, ibkr_connection=None):
         """
         Initialize Vanna calculator
         
         Args:
             risk_free_rate: Risk-free rate (e.g., 0.045 = 4.5%)
-                           If None, will fetch dynamically from IBKR/env
+                           If None, will fetch dynamically from IBKR
+            ibkr_connection: IBKR connection for fetching Treasury yields
         """
+        self.ibkr_connection = ibkr_connection
+        
         if risk_free_rate is not None:
-            # User-provided rate
+            # User-provided rate (static)
             self.risk_free_rate = risk_free_rate
             self.use_dynamic_rate = False
+            logger.debug(f"VannaCalculator: Using static rate {risk_free_rate:.4f}")
         else:
-            # Will fetch dynamically
+            # Will fetch dynamically from IBKR
             self.risk_free_rate = None  # Fetched on demand
             self.use_dynamic_rate = True
+            logger.debug("VannaCalculator: Will fetch dynamic rate from IBKR")
     
-    def calculate_vanna(
+    async def calculate_vanna(
         self,
         S: float,
         K: float,
@@ -45,6 +52,8 @@ class VannaCalculator:
         Calculate Vanna using Black-Scholes analytical formula
         
         Vanna = ∂²V/∂S∂σ = (Vega/S) × (d₂/(σ√T))
+        
+        Uses DYNAMIC risk-free rate from IBKR if not specified.
         
         Args:
             S: Underlying price
@@ -60,8 +69,11 @@ class VannaCalculator:
             if T <= 0 or sigma <= 0 or S <= 0:
                 return None
             
+            # Get risk-free rate (dynamic if enabled)
+            r = await self._get_risk_free_rate()
+            
             # Calculate d1 and d2
-            d1 = (np.log(S / K) + (self.risk_free_rate + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+            d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
             d2 = d1 - sigma * np.sqrt(T)
             
             # Black-Scholes Vanna formula
@@ -71,9 +83,6 @@ class VannaCalculator:
             phi_d1 = norm.pdf(d1)  # Standard normal PDF
             
             vanna = -(phi_d1 * d2) / (S * sigma * np.sqrt(T))
-            
-            # Vanna can also be expressed as:
-            # Vanna = Vega/S × d2/(σ√T)
             
             logger.debug(
                 f"Vanna: S={S:.2f}, K={K:.2f}, T={T:.3f}y, σ={sigma:.2%}, "
@@ -86,7 +95,33 @@ class VannaCalculator:
             logger.error(f"Error calculating Vanna: {e}")
             return None
     
-    def calculate_vanna_from_vega(
+    async def _get_risk_free_rate(self) -> float:
+        """
+        Get risk-free rate (dynamic or static)
+        
+        Returns:
+            Risk-free rate as decimal (e.g., 0.045)
+        """
+        if not self.use_dynamic_rate:
+            # Use static rate
+            return self.risk_free_rate
+        
+        # Fetch dynamic rate from IBKR
+        if self.risk_free_rate is None:  # Not cached yet
+            from data.risk_free_rate_fetcher import get_current_risk_free_rate
+            
+            try:
+                rate = await get_current_risk_free_rate(self.ibkr_connection)
+                self.risk_free_rate = rate  # Cache for this instance
+                logger.info(f"📊 VannaCalculator: Using dynamic rate {rate:.4f} ({rate*100:.2f}%)")
+                return rate
+            except Exception as e:
+                logger.warning(f"Failed to fetch dynamic rate: {e}, using fallback 4.5%")
+                return 0.045  # Fallback
+        
+        return self.risk_free_rate
+    
+    async def calculate_vanna_from_vega(
         self,
         vega: float,
         S: float,
@@ -113,8 +148,11 @@ class VannaCalculator:
             if T <= 0 or sigma <= 0 or S <= 0:
                 return None
             
+            # Get risk-free rate
+            r = await self._get_risk_free_rate()
+            
             # Calculate d2
-            d1 = (np.log(S / K) + (self.risk_free_rate + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+            d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
             d2 = d1 - sigma * np.sqrt(T)
             
             # Vanna from Vega
@@ -126,7 +164,7 @@ class VannaCalculator:
             logger.error(f"Error calculating Vanna from Vega: {e}")
             return None
     
-    def calculate_vanna_numerical(
+    async def calculate_vanna_numerical(
         self,
         S: float,
         K: float,
@@ -155,11 +193,14 @@ class VannaCalculator:
             if T <= 0 or sigma <= 0 or S <= 0:
                 return None
             
+            # Get risk-free rate
+            r = await self._get_risk_free_rate()
+            
             # Calculate Delta at current IV
-            delta_1 = self._calculate_delta(S, K, T, sigma, option_type)
+            delta_1 = await self._calculate_delta(S, K, T, sigma, option_type, r)
             
             # Calculate Delta at IV + d_sigma
-            delta_2 = self._calculate_delta(S, K, T, sigma + d_sigma, option_type)
+            delta_2 = await self._calculate_delta(S, K, T, sigma + d_sigma, option_type, r)
             
             # Vanna = ∂Delta/∂σ
             vanna = (delta_2 - delta_1) / d_sigma
@@ -175,16 +216,20 @@ class VannaCalculator:
             logger.error(f"Error calculating numerical Vanna: {e}")
             return None
     
-    def _calculate_delta(
+    async def _calculate_delta(
         self,
         S: float,
         K: float,
         T: float,
         sigma: float,
-        option_type: str
+        option_type: str,
+        r: Optional[float] = None
     ) -> float:
         """Calculate Black-Scholes Delta"""
-        d1 = (np.log(S / K) + (self.risk_free_rate + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+        if r is None:
+            r = await self._get_risk_free_rate()
+        
+        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
         
         if option_type.lower() == 'call':
             return norm.cdf(d1)
@@ -196,9 +241,18 @@ class VannaCalculator:
 _vanna_calculator: Optional[VannaCalculator] = None
 
 
-def get_vanna_calculator(risk_free_rate: float = 0.045) -> VannaCalculator:
-    """Get or create singleton Vanna calculator"""
+def get_vanna_calculator(risk_free_rate: Optional[float] = None, ibkr_connection=None) -> VannaCalculator:
+    """
+    Get or create singleton Vanna calculator
+    
+    Args:
+        risk_free_rate: Static rate (optional). If None, uses dynamic IBKR rate.
+        ibkr_connection: IBKR connection for fetching Treasury yields
+        
+    Returns:
+        VannaCalculator instance
+    """
     global _vanna_calculator
     if _vanna_calculator is None:
-        _vanna_calculator = VannaCalculator(risk_free_rate)
+        _vanna_calculator = VannaCalculator(risk_free_rate, ibkr_connection)
     return _vanna_calculator
