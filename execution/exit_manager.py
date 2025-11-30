@@ -258,10 +258,6 @@ class ExitManager:
             
             # Calculate P/L
             pnl = (entry_credit - exit_price) * contracts * 100
-            
-            # Update position
-            await self.db.execute(
-                """
                 UPDATE positions
                 SET status = 'CLOSED',
                     exit_date = ?,
@@ -291,6 +287,222 @@ class ExitManager:
         except Exception as e:
             logger.error(f"Error closing position: {e}")
             return False
+    
+    async def place_closing_order(
+        self,
+        position: Dict[str, Any],
+        reason: str = "Manual Exit"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Place atomic closing order for position
+        
+        CRITICAL: Uses IBKR BAG/Combo orders for multi-leg positions
+        to prevent leg risk (partial fills).
+        
+        Args:
+            position: Position to close
+            reason: Exit reason
+            
+        Returns:
+            Order result or None
+        """
+        try:
+            ib = self.ibkr.get_client()
+            
+            if not ib or not ib.isConnected():
+                logger.error("Not connected to IBKR for closing")
+                return None
+            
+            symbol = position['symbol']
+            strategy = position['strategy']
+            
+            logger.info(
+                f"🔒 Closing position: {symbol} {strategy}\n"
+                f"   Reason: {reason}\n"
+                f"   Method: ATOMIC COMBO ORDER (BAG)"
+            )
+            
+            # Get position legs from database
+            legs = await self._get_position_legs(position['id'])
+            
+            if not legs:
+                logger.error(f"No legs found for position {position['id']}")
+                return None
+            
+            # Create CLOSING combo order (atomic execution)
+            combo_order = await self._create_closing_combo_order(
+                symbol=symbol,
+                legs=legs,
+                strategy=strategy
+            )
+            
+            if not combo_order:
+                logger.error("Failed to create combo closing order")
+                return None
+            
+            # Execute atomic combo order
+            logger.info(f"Submitting ATOMIC combo closing order for {symbol}...")
+            
+            trade = ib.placeOrder(combo_order['contract'], combo_order['order'])
+            
+            # Wait for fill
+            await asyncio.sleep(2)
+            
+            status = trade.orderStatus.status
+            
+            if status in ['Filled', 'PartiallyFilled']:
+                logger.info(
+                    f"✅ Position closed: {symbol}\n"
+                    f"   Fill Price: ${trade.orderStatus.avgFillPrice:.2f}\n"
+                    f"   Execution: ATOMIC (all legs together)"
+                )
+                
+                # Update position in database
+                await self._mark_position_closed(
+                    position_id=position['id'],
+                    exit_price=trade.orderStatus.avgFillPrice,
+                    exit_reason=reason
+                )
+                
+                return {
+                    'status': 'FILLED',
+                    'symbol': symbol,
+                    'fill_price': trade.orderStatus.avgFillPrice,
+                    'execution_type': 'ATOMIC_COMBO',
+                    'reason': reason
+                }
+            else:
+                logger.warning(f"Closing order not filled: {status}")
+                return {
+                    'status': status,
+                    'symbol': symbol
+                }
+            
+        except Exception as e:
+            logger.error(f"Error placing closing order: {e}")
+            return None
+    
+    async def _create_closing_combo_order(
+        self,
+        symbol: str,
+        legs: List[Dict[str, Any]],
+        strategy: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Create atomic BAG order for closing multi-leg position
+        
+        BAG = Basket/Combo instrument in IBKR
+        All legs execute together or not at all.
+        
+        Args:
+            symbol: Underlying symbol
+            legs: Position legs to close
+            strategy: Strategy type
+            
+        Returns:
+            Dict with contract and order, or None
+        """
+        try:
+            from ib_insync import Contract, Order, ComboLeg
+            
+            ib = self.ibkr.get_client()
+            
+            # Create BAG contract
+            bag = Contract()
+            bag.symbol = symbol
+            bag.secType = 'BAG'
+            bag.currency = 'USD'
+            bag.exchange = 'SMART'
+            
+            # Add legs to BAG (reverse of opening positions)
+            combo_legs = []
+            total_quantity = 0
+            
+            for leg in legs:
+                combo_leg = ComboLeg()
+                combo_leg.conId = leg['contract_id']
+                
+                # REVERSE the action (BUY → SELL, SELL → BUY)
+                if leg['action'] == 'BUY':
+                    combo_leg.action = 'SELL'  # Close long position
+                elif leg['action'] == 'SELL':
+                    combo_leg.action = 'BUY'   # Close short position
+                
+                combo_leg.ratio = 1
+                combo_leg.exchange = 'SMART'
+                
+                combo_legs.append(combo_leg)
+                total_quantity = abs(leg['quantity'])
+            
+            bag.comboLegs = combo_legs
+            
+            # Qualify the BAG contract
+            qualified = await ib.qualifyContractsAsync(bag)
+            
+            if not qualified:
+                logger.error("Could not qualify BAG contract for closing")
+                return None
+            
+            bag = qualified[0]
+            
+            # Create MARKET order for closing (want immediate execution)
+            # Alternative: Limit order at mid-price
+            order = Order()
+            order.action = 'BUY' if strategy in ['IRON_CONDOR', 'CREDIT_SPREAD'] else 'SELL'
+            order.totalQuantity = total_quantity
+            order.orderType = 'MKT'  # Market for fast close
+            order.transmit = True
+            
+            logger.info(
+                f"Created ATOMIC BAG closing order:\n"
+                f"  Symbol: {symbol}\n"
+                f"  Legs: {len(combo_legs)}\n"
+                f"  Quantity: {total_quantity}\n"
+                f"  Order Type: MARKET (atomic execution)"
+            )
+            
+            return {
+                'contract': bag,
+                'order': order
+            }
+            
+        except Exception as e:
+            logger.error(f"Error creating combo closing order: {e}")
+            return None
+    
+    async def _get_position_legs(self, position_id: int) -> List[Dict[str, Any]]:
+        """
+        Get all open positions
+        
+        Returns:
+            List of Position objects
+        """
+        try:
+            cursor = await self.db.execute(
+                """
+                SELECT contract_symbol, action, strike, option_type, quantity, entry_price
+                FROM position_legs
+                WHERE position_id = ?
+                """,
+                (position_id,)
+            )
+            rows = await cursor.fetchall()
+            
+            legs = [
+                {
+                    'symbol': l[0],
+                    'action': l[1],
+                    'strike': l[2],
+                    'option_type': l[3],
+                    'quantity': l[4],
+                    'price': l[5]
+                }
+                for l in rows
+            ]
+            return legs
+        except Exception as e:
+            logger.error(f"Error getting position legs for {position_id}: {e}")
+            return []
     
     async def get_open_positions(self) -> List[Position]:
         """

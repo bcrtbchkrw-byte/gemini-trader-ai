@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Scheduler - Runs premarket scan and full pipeline at scheduled times
-Prevents constant AI calls by running strategically timed scans.
+Trading Scheduler - Automated premarket scan and analysis
+Runs premarket scanner and AI analysis on schedule.
 """
-import asyncio
-from datetime import datetime, time
+from typing import Dict, Any, Optional
 from loguru import logger
-from automation.premarket_scanner import get_premarket_scanner
-from analysis.stock_screener import get_stock_screener
+from datetime import datetime, time
+import asyncio
+import os
+
+from analysis.stock_screener_ibkr import get_stock_screener  # IBKR native scanner
 from ai.gemini_client import get_gemini_client
 
 

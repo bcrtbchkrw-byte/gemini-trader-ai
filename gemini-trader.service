@@ -1,0 +1,25 @@
+[Unit]
+Description=Gemini Trader AI - Options Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=jakub
+WorkingDirectory=/home/jakub/.gemini/antigravity/scratch/gemini-trader-ai
+Environment="PATH=/usr/bin:/usr/local/bin"
+ExecStart=/usr/bin/python3 /home/jakub/.gemini/antigravity/scratch/gemini-trader-ai/main.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/jakub/.gemini/antigravity/scratch/gemini-trader-ai/logs/gemini_trader.log
+StandardError=append:/home/jakub/.gemini/antigravity/scratch/gemini-trader-ai/logs/gemini_trader_error.log
+
+# Resource limits (important for Raspberry Pi)
+MemoryMax=1G
+CPUQuota=80%
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

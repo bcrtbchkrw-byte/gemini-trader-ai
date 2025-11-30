@@ -1,23 +1,43 @@
 """
-VIX Monitor
-Continuous VIX monitoring and regime classification.
+VIX Monitor - Enhanced Market Regime Detection
+Monitors VIX spot + term structure (VIX/VIX3M) for comprehensive regime analysis.
 """
-from typing import Optional
-from datetime import datetime
+from typing import Optional, Dict, Any
+from datetime import datetime, timedelta
 from loguru import logger
 from config import get_config
 from ibkr.data_fetcher import get_data_fetcher
 
 
 class VIXMonitor:
-    """Monitor VIX and classify market regime"""
+    """
+    Monitor VIX and term structure for market regime detection
+    
+    Term structure features:
+    - VIX/VIX3M ratio
+    - Contango vs Backwardation
+    - Stress level classification
+    """
     
     def __init__(self):
-        self.config = get_config().vix_regimes
+        self.config = get_config().vix_regimes # Keep this for now, might be replaced by new regime logic
         self.data_fetcher = get_data_fetcher()
-        self._current_vix: Optional[float] = None
-        self._current_regime: Optional[str] = None
-        self._last_update: Optional[datetime] = None
+        
+        self.current_vix: Optional[float] = None
+        self.current_vix3m: Optional[float] = None
+        self.vix_ratio: Optional[float] = None  # VIX / VIX3M
+        self.term_structure: Optional[str] = None  # 'CONTANGO' or 'BACKWARDATION'
+        self._current_regime: Optional[str] = None # Renamed from _current_regime to match new structure
+        self._last_update: Optional[datetime] = None # Renamed from _last_update to match new structure
+        
+        # Enhanced regime thresholds (example, adjust as needed)
+        self.regimes = {
+            'LOW_VOL': {'vix_max': 15, 'ratio_max': 0.95},
+            'NORMAL': {'vix_max': 20, 'ratio_max': 1.0},
+            'ELEVATED': {'vix_max': 30, 'ratio_max': 1.05},
+            'HIGH_VOL': {'vix_max': 40, 'ratio_max': 1.1},
+            'EXTREME': {'vix_min': 40, 'ratio_min': 1.1}
+        }
     
     async def update(self) -> bool:
         """
@@ -28,23 +48,34 @@ class VIXMonitor:
         """
         try:
             vix_value = await self.data_fetcher.get_vix()
+            vix3m_value = await self.data_fetcher.get_vix3m() # Assuming a new method for VIX3M
             
-            if vix_value is None:
-                logger.warning("Failed to fetch VIX value")
+            if vix_value is None or vix3m_value is None:
+                logger.warning("Failed to fetch VIX or VIX3M value")
                 return False
             
             old_regime = self._current_regime
-            self._current_vix = vix_value
-            self._current_regime = self.config.get_regime(vix_value)
+            self.current_vix = vix_value
+            self.current_vix3m = vix3m_value
+            
+            self._calculate_term_structure() # Calculate ratio and term structure
+            self._current_regime = self._determine_enhanced_regime() # Determine regime based on new logic
             self._last_update = datetime.now()
             
             # Log regime changes
             if old_regime and old_regime != self._current_regime:
                 logger.warning(
-                    f"⚠️ VIX REGIME CHANGE: {old_regime} → {self._current_regime} (VIX: {vix_value:.2f})"
+                    f"⚠️ VIX REGIME CHANGE: {old_regime} → {self._current_regime} "
+                    f"(VIX: {self.current_vix:.2f}, VIX3M: {self.current_vix3m:.2f}, Ratio: {self.vix_ratio:.3f})"
                 )
             else:
-                logger.info(f"VIX: {vix_value:.2f} | Regime: {self._current_regime}")
+                logger.info(
+                    f"VIX Update: Spot={self.current_vix:.2f}, "
+                    f"3M={self.current_vix3m:.2f}, "
+                    f"Ratio={self.vix_ratio:.3f}, "
+                    f"Structure={self.term_structure}, "
+                    f"Regime={self._current_regime}"
+                )
             
             return True
             

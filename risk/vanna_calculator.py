@@ -1,6 +1,6 @@
 """
-Precise Vanna Calculator using Black-Scholes
-Provides accurate second-order Greek calculation for risk management.
+Vanna Calculator - Precise second-order Greek calculation
+Uses Black-Scholes analytical formula with DYNAMIC risk-free rate.
 """
 from typing import Optional
 import numpy as np
@@ -9,16 +9,29 @@ from loguru import logger
 
 
 class VannaCalculator:
-    """Calculate Vanna using analytical Black-Scholes formula"""
+    """
+    Calculate Vanna (∂²V/∂S∂σ) using Black-Scholes
     
-    def __init__(self, risk_free_rate: float = 0.045):
+    Vanna measures sensitivity of Delta to changes in volatility.
+    Critical for stress testing options strategies.
+    """
+    
+    def __init__(self, risk_free_rate: Optional[float] = None):
         """
         Initialize Vanna calculator
         
         Args:
-            risk_free_rate: Risk-free rate (default 4.5%)
+            risk_free_rate: Risk-free rate (e.g., 0.045 = 4.5%)
+                           If None, will fetch dynamically from IBKR/env
         """
-        self.risk_free_rate = risk_free_rate
+        if risk_free_rate is not None:
+            # User-provided rate
+            self.risk_free_rate = risk_free_rate
+            self.use_dynamic_rate = False
+        else:
+            # Will fetch dynamically
+            self.risk_free_rate = None  # Fetched on demand
+            self.use_dynamic_rate = True
     
     def calculate_vanna(
         self,

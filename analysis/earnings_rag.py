@@ -197,19 +197,19 @@ Look at YoY growth trends - slowing growth is concerning.
         ai_client  # Claude or Gemini client
     ) -> Dict[str, Any]:
         """
-        Get AI analysis enhanced with RAG earnings context
+        Get AI analysis enhanced with RAG earnings context + transcript tone
         
-        This is the full RAG pipeline:
+        This is the FULL RAG pipeline:
         1. RETRIEVE: Fetch real earnings data
-        2. AUGMENT: Format as context
-        3. GENERATE: AI analyzes with real data
+        2. AUGMENT: Format as context + fetch transcript
+        3. GENERATE: AI analyzes with real data + management tone
         
         Args:
             symbol: Stock ticker
             ai_client: AI client (Claude/Gemini)
             
         Returns:
-            AI analysis with earnings context
+            AI analysis with earnings context and tone analysis
         """
         try:
             # Step 1: RETRIEVE earnings data
@@ -222,54 +222,82 @@ Look at YoY growth trends - slowing growth is concerning.
                     'analysis': 'No recent earnings data available'
                 }
             
-            # Step 2: AUGMENT - create context
+            # Step 2: AUGMENT - create numerical context
             rag_context = self.create_rag_context(earnings_data)
             
-            # Step 3: GENERATE - AI analysis with context
+            # Step 2b: AUGMENT - fetch and analyze transcript (NEW!)
+            from analysis.earnings_transcript import get_transcript_analyzer
+            
+            transcript_analyzer = get_transcript_analyzer()
+            transcript = await transcript_analyzer.fetch_transcript(symbol)
+            
+            tone_analysis = None
+            if transcript:
+                logger.info(f"📞 Analyzing earnings call tone for {symbol}...")
+                tone_analysis = await transcript_analyzer.analyze_management_tone(
+                    symbol=symbol,
+                    transcript=transcript,
+                    earnings_data=earnings_data,
+                    gemini_client=ai_client  # Use Gemini for tone analysis
+                )
+            
+            # Step 3: GENERATE - AI analysis with BOTH numbers and tone
             prompt = f"""
-You are analyzing {symbol} with REAL EARNINGS DATA (not guessing).
+You are analyzing {symbol} with COMPLETE EARNINGS CONTEXT.
 
 {rag_context}
+"""
+            
+            if tone_analysis:
+                prompt += f"""
 
-Based on these ACTUAL numbers, provide:
+**MANAGEMENT TONE ANALYSIS (from Earnings Call):**
+- Confidence Score: {tone_analysis.get('confidence_score', 'N/A')}/10
+- Guidance Tone: {tone_analysis.get('guidance_tone', 'N/A')}
+- Management Sentiment: {tone_analysis.get('management_sentiment', 'N/A')}
+- Red Flags: {', '.join(tone_analysis.get('red_flags', []))}
+- Green Flags: {', '.join(tone_analysis.get('green_flags', []))}
+- Key Insight: {tone_analysis.get('reasoning', 'N/A')}
 
-1. **Earnings Quality Score** (1-10):
-   - Did they beat or miss?
-   - How significant was the surprise?
-   - Is growth accelerating or slowing?
+**CRITICAL:** Management tone often predicts stock movement better than numbers!
+- Good numbers + cautious tone = BEARISH
+- Miss numbers + confident tone = could be BULLISH
+"""
+            
+            prompt += """
 
-2. **Guidance Analysis**:
-   - Did guidance meet/beat/miss expectations?
-   - Is management optimistic or cautious?
+Based on BOTH the numerical data AND management tone:
 
-3. **Trading Implications**:
-   - Is this bullish or bearish for options?
-   - What's the IV likely to do post-earnings?
-
-4. **Confidence** (1-10):
-   - How clear is the signal from this data?
+1. **Overall Earnings Quality** (1-10)
+2. **Trading Implication** (Bullish/Neutral/Bearish)
+3. **Confidence in Signal** (1-10)
+4. **Reasoning** (2-3 sentences)
 
 Format as JSON:
-{{
-    "earnings_quality_score": 8,
-    "guidance_analysis": "beat/meet/miss",
-    "trading_implication": "bullish/neutral/bearish",
-    "confidence": 9,
-    "reasoning": "explanation"
-}}
+{
+    "overall_earnings_quality": 8,
+    "trading_implication": "bullish",
+    "confidence_in_signal": 9,
+    "reasoning": "explanation combining numbers AND tone"
+}
 """
             
             # Call AI with enriched context
             if hasattr(ai_client, 'analyze_with_context'):
                 analysis = await ai_client.analyze_with_context(prompt)
             else:
-                # Fallback for existing AI clients
+                # Fallback
                 logger.info("Using RAG context with standard AI call")
                 analysis = {
                     'has_earnings_data': True,
                     'rag_context': rag_context,
-                    'earnings_data': earnings_data
+                    'earnings_data': earnings_data,
+                    'tone_analysis': tone_analysis
                 }
+            
+            # Add tone analysis to result
+            if tone_analysis:
+                analysis['management_tone'] = tone_analysis
             
             return analysis
             

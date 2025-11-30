@@ -44,6 +44,23 @@ class GeminiTraderAI:
             logger.error("Failed to connect to IBKR. Please ensure TWS/IB Gateway is running.")
             return False
         
+        # CRITICAL: Reconcile positions after restart
+        logger.info("\n🔄 Reconciling positions with IBKR portfolio...")
+        from data.position_reconciler import get_position_reconciler
+        
+        reconciler = get_position_reconciler(self.db, self.ibkr)
+        reconciliation_report = await reconciler.reconcile_positions()
+        
+        if not reconciliation_report.get('success'):
+            logger.error("Position reconciliation failed - proceeding with caution")
+        else:
+            closed_externally = len(reconciliation_report.get('closed_externally', []))
+            if closed_externally > 0:
+                logger.warning(
+                    f"⚠️  Found {closed_externally} positions closed externally! "
+                    f"DB updated."
+                )
+        
         # Initialize components
         self.vix_monitor = get_vix_monitor()
         self.gemini = get_gemini_client()
@@ -106,7 +123,6 @@ class GeminiTraderAI:
         Phase 3: IBKR Greeks + Claude strategy → executable trades
         """
         try:
-            from analysis.stock_screener import get_stock_screener, ScreeningCriteria
             from analysis.news_fetcher import get_news_fetcher
             from ibkr.data_fetcher import get_data_fetcher
             
