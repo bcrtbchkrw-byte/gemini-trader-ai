@@ -133,7 +133,11 @@ class TradingScheduler:
             logger.error(f"Error caching analysis: {e}")
     
     async def run_weekly_loss_analysis(self):
-        """Run weekly analysis of losing trades"""
+        """
+        Run weekly analysis of ALL losing trades
+        
+        Analyzes all losses from the past week (no limit)
+        """
         try:
             logger.info("🔍 Starting Weekly Loss Analysis...")
             
@@ -141,7 +145,13 @@ class TradingScheduler:
             from notifications.telegram_notifier import get_telegram_notifier
             
             analyzer = get_loss_analyzer()
-            report = await analyzer.analyze_recent_losses(days=7)
+            
+            # Analyze ALL losses from past 7 days
+            # max_analyses=20 prevents excessive Claude API costs if many losses
+            report = await analyzer.analyze_recent_losses(
+                days=7,
+                max_analyses=20
+            )
             
             # Send report via Telegram
             telegram = get_telegram_notifier()
@@ -150,7 +160,7 @@ class TradingScheduler:
                 parse_mode='Markdown'
             )
             
-            logger.info("Weekly loss analysis completed and sent.")
+            logger.info("✅ Weekly loss analysis completed and sent.")
             
         except Exception as e:
             logger.error(f"Error in weekly loss analysis: {e}")

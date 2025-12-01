@@ -1,6 +1,8 @@
 """
 Loss Analyzer - AI-Powered Post-Mortem Analysis
 Analyzes losing trades to identify root causes and generate prevention strategies.
+
+Uses Claude Opus 4.5 for deep analysis due to superior reasoning capabilities.
 """
 from typing import List, Dict, Any, Optional
 from loguru import logger
@@ -8,7 +10,7 @@ from datetime import datetime, timedelta
 import asyncio
 
 from data.database import get_database
-from ai.gemini_client import get_gemini_client
+from ai.claude_client import get_claude_client
 from ibkr.data_fetcher import get_data_fetcher
 
 
@@ -25,20 +27,25 @@ class LossAnalyzer:
     
     def __init__(self):
         self.db = None
-        self.gemini = get_gemini_client()
+        self.claude = get_claude_client(use_opus=True)  # Use Opus 4.5 for deep analysis
         self.data_fetcher = get_data_fetcher()
         
     async def initialize(self):
         """Initialize database connection"""
         self.db = await get_database()
         
-    async def analyze_recent_losses(self, days: int = 30, limit: int = 5) -> str:
+    async def analyze_recent_losses(
+        self, 
+        days: int = 7, 
+        max_analyses: int = 20
+    ) -> str:
         """
         Analyze recent losing trades and generate a report
         
         Args:
-            days: Lookback period
-            limit: Max trades to analyze
+            days: Lookback period (default 7 for weekly analysis)
+            max_analyses: Maximum trades to send to Claude for deep analysis
+                          (prevents excessive API costs if there are many losses)
             
         Returns:
             Markdown report
@@ -46,24 +53,43 @@ class LossAnalyzer:
         if not self.db:
             await self.initialize()
             
-        # 1. Get losing trades
-        losses = await self.db.get_losing_trades(limit=limit, days=days)
+        # 1. Get ALL losing trades in period (no limit)
+        losses = await self.db.get_losing_trades(limit=None, days=days)
         
         if not losses:
             logger.info("No losing trades found in recent history! 🎉")
             return "No recent losses to analyze. Great job! 🎉"
         
-        logger.info(f"Analyzing {len(losses)} losing trades...")
+        logger.info(f"Found {len(losses)} losing trades in last {days} days")
         
-        # 2. Analyze each loss
+        # Calculate total loss
+        total_loss = sum(trade['realized_pnl'] for trade in losses)
+        logger.info(f"Total loss: ${total_loss:.2f}")
+        
+        # 2. Analyze each loss (with safety limit for API costs)
         analyses = []
-        for trade in losses:
+        
+        # Analyze worst losses first (already sorted by realized_pnl ASC)
+        trades_to_analyze = losses[:max_analyses] if len(losses) > max_analyses else losses
+        
+        if len(losses) > max_analyses:
+            logger.warning(
+                f"⚠️  Found {len(losses)} losses, analyzing worst {max_analyses} "
+                f"to control Claude API costs"
+            )
+        
+        for i, trade in enumerate(trades_to_analyze, 1):
+            logger.info(f"Analyzing loss {i}/{len(trades_to_analyze)}: {trade['symbol']} (${trade['realized_pnl']:.2f})")
             analysis = await self._analyze_single_loss(trade)
             if analysis:
                 analyses.append(analysis)
         
-        # 3. Generate synthesis report
-        report = await self._generate_prevention_report(analyses)
+        # 3. Generate synthesis report (includes all losses, even non-analyzed ones)
+        report = await self._generate_prevention_report(
+            analyses, 
+            total_losses=len(losses),
+            total_loss_amount=total_loss
+        )
         
         return report
     
@@ -113,7 +139,7 @@ class LossAnalyzer:
             }}
             """
             
-            response = await self.gemini.generate_response(prompt)
+            response = await self.claude.generate_response(prompt)
             
             # Parse JSON (simplified)
             import json
@@ -134,31 +160,49 @@ class LossAnalyzer:
             logger.error(f"Error analyzing trade {trade.get('symbol')}: {e}")
             return None
             
-    async def _generate_prevention_report(self, analyses: List[Dict[str, Any]]) -> str:
-        """Synthesize analyses into a prevention report"""
+    async def _generate_prevention_report(
+        self, 
+        analyses: List[Dict[str, Any]],
+        total_losses: int,
+        total_loss_amount: float
+    ) -> str:
+        """
+        Synthesize analyses into a prevention report
+        
+        Args:
+            analyses: List of AI analyses for individual trades
+            total_losses: Total number of losing trades found
+            total_loss_amount: Total $ amount of all losses
+        """
         if not analyses:
             return "Analysis failed."
             
         # Group by category
         categories = {}
-        total_loss = 0
+        analyzed_loss = 0
         
         for a in analyses:
             cat = a.get('category', 'UNKNOWN')
             if cat not in categories:
                 categories[cat] = []
             categories[cat].append(a)
-            total_loss += a.get('pnl', 0)
+            analyzed_loss += a.get('pnl', 0)
             
         # Generate Markdown
         report = f"""
 # 📉 Loss Analysis Report
-**Total Analyzed Loss:** ${total_loss:.2f}
-**Trades Analyzed:** {len(analyses)}
+**Total Losses Found:** {total_losses} trades
+**Total Loss Amount:** ${total_loss_amount:.2f}
 
-## 🔍 Root Cause Breakdown
-
+**Analyzed in Detail:** {len(analyses)} worst trades (${analyzed_loss:.2f})
 """
+        
+        # Add note if not all trades were analyzed
+        if len(analyses) < total_losses:
+            report += f"*(Analyzed worst {len(analyses)} to control API costs)*\n"
+        
+        report += "\n## 🔍 Root Cause Breakdown\n\n"
+        
         for cat, items in categories.items():
             report += f"### {cat} ({len(items)} trades)\n"
             for item in items:
@@ -170,8 +214,8 @@ class LossAnalyzer:
         summary_prompt = f"""
         Based on these losing trades, suggest 3 SYSTEMIC improvements to the trading bot.
         
-        Losses:
-        {analyses}
+        Total losses in period: {total_losses} trades, ${total_loss_amount:.2f}
+        Analyzed trades: {analyses}
         
         Focus on:
         - Risk management rules
@@ -181,7 +225,7 @@ class LossAnalyzer:
         Format as Markdown bullet points.
         """
         
-        improvements = await self.gemini.generate_response(summary_prompt)
+        improvements = await self.claude.generate_response(summary_prompt)
         
         report += "## 🛡️ Strategic Improvements\n\n"
         report += improvements

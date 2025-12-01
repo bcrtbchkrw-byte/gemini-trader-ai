@@ -386,6 +386,54 @@ Format response as JSON:
             logger.error(f"Error generating Claude response: {e}")
             return None
     
+    async def generate_response(
+        self, 
+        prompt: str,
+        max_tokens: int = 4000,
+        temperature: float = 0.7
+    ) -> str:
+        """
+        Generate general text response (for LossAnalyzer, etc.)
+        
+        Args:
+            prompt: Input prompt
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature (0.0-1.0)
+            
+        Returns:
+            Generated text response
+        """
+        # Check daily limit
+        if not self.can_make_request():
+            logger.warning("Claude daily limit reached, using fallback response")
+            return "Analysis unavailable - daily API limit reached."
+        
+        try:
+            # Create message
+            message = self.client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            
+            # Track usage
+            if hasattr(message, 'usage'):
+                self._track_usage(message.usage.input_tokens, message.usage.output_tokens)
+            
+            if message and message.content:
+                response_text = message.content[0].text
+                return response_text
+            
+            return "No response generated."
+            
+        except Exception as e:
+            logger.error(f"Error generating Claude response: {e}")
+            return f"Error: {str(e)}"
+    
+    
     async def stress_test_greeks(
         self,
         options_data: Dict[str, Any],
@@ -459,13 +507,31 @@ Format response as JSON:
             }
 
 
-# Singleton instance
+# Singleton instances
 _claude_client: Optional[ClaudeClient] = None
+_claude_opus_client: Optional[ClaudeClient] = None
 
 
-def get_claude_client() -> ClaudeClient:
-    """Get or create singleton Claude client instance"""
-    global _claude_client
-    if _claude_client is None:
-        _claude_client = ClaudeClient()
-    return _claude_client
+def get_claude_client(use_opus: bool = False) -> ClaudeClient:
+    """
+    Get or create singleton Claude client instance
+    
+    Args:
+        use_opus: If True, uses Claude Opus 4.5 for deeper analysis
+                  If False, uses Claude 3.5 Sonnet (default)
+    
+    Returns:
+        ClaudeClient instance
+    """
+    global _claude_client, _claude_opus_client
+    
+    if use_opus:
+        if _claude_opus_client is None:
+            _claude_opus_client = ClaudeClient()
+            logger.info("Initialized Claude Opus 4.5 client for deep analysis")
+        return _claude_opus_client
+    else:
+        if _claude_client is None:
+            _claude_client = ClaudeClient()
+        return _claude_client
+

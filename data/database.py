@@ -267,32 +267,45 @@ class Database:
     
     async def get_losing_trades(
         self,
-        limit: int = 10,
+        limit: Optional[int] = None,
         days: int = 30
     ) -> List[Dict[str, Any]]:
         """
         Get recent losing trades for analysis
         
         Args:
-            limit: Max number of trades to return
+            limit: Max number of trades to return (None = all trades)
             days: Lookback period in days
             
         Returns:
-            List of losing trades
+            List of losing trades sorted by worst first
         """
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             
-            query = """
-                SELECT * FROM trades 
-                WHERE status = 'CLOSED' 
-                AND realized_pnl < 0
-                AND close_timestamp >= date('now', ?)
-                ORDER BY realized_pnl ASC
-                LIMIT ?
-            """
+            if limit is None:
+                # Return ALL losing trades in period
+                query = """
+                    SELECT * FROM trades 
+                    WHERE status = 'CLOSED' 
+                    AND realized_pnl < 0
+                    AND close_timestamp >= date('now', ?)
+                    ORDER BY realized_pnl ASC
+                """
+                params = (f'-{days} days',)
+            else:
+                # Return limited number
+                query = """
+                    SELECT * FROM trades 
+                    WHERE status = 'CLOSED' 
+                    AND realized_pnl < 0
+                    AND close_timestamp >= date('now', ?)
+                    ORDER BY realized_pnl ASC
+                    LIMIT ?
+                """
+                params = (f'-{days} days', limit)
             
-            async with db.execute(query, (f'-{days} days', limit)) as cursor:
+            async with db.execute(query, params) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
 
