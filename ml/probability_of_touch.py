@@ -28,13 +28,27 @@ class ProbabilityOfTouchModel:
         self.model_path = Path(model_path)
         self.model = None
         self.scaler = None
+        self.mode = 'UNKNOWN'  # Track current mode: ML or ANALYTICAL
+        self.fallback_warning_shown = False
         
         # Try to load existing model
         if self.model_path.exists():
             self.load_model()
-        else:
-            logger.warning(f"No trained PoT model found at {model_path}")
-            logger.info("Will use analytical approximation until model is trained")
+            if self.model is not None:
+                self.mode = 'ML'
+                logger.info("✅ ProbabilityOfTouch: Running in ML mode")
+        
+        if self.model is None:
+            self.mode = 'ANALYTICAL'
+            logger.error("")
+            logger.error("="*70)
+            logger.error("⚠️  WARNING: ProbabilityOfTouch - NO TRAINED MODEL FOUND")
+            logger.error(f"   Model path: {model_path}")
+            logger.error("   🟡 RUNNING IN ANALYTICAL APPROXIMATION MODE")
+            logger.error("   This uses Black-Scholes formula instead of ML")
+            logger.error("   TO FIX: Run python -m ml.scripts.prepare_ml_training_pipeline")
+            logger.error("="*70)
+            logger.error("")
     
     def extract_pot_features(
         self,
@@ -194,6 +208,9 @@ class ProbabilityOfTouchModel:
         
         if self.model is None or self.scaler is None:
             # Fallback to analytical approximation
+            if not self.fallback_warning_shown:
+                logger.warning("🟡 Using ANALYTICAL approximation (no ML model)")
+                self.fallback_warning_shown = True
             return self._analytical_pot(current_price, strike, dte, iv)
         
         try:
@@ -208,12 +225,13 @@ class ProbabilityOfTouchModel:
             # Clip to [0, 1]
             pot = float(np.clip(pot, 0.0, 1.0))
             
-            logger.debug(f"PoT for strike {strike}: {pot:.1%}")
+            logger.debug(f"✨ ML PoT for strike {strike}: {pot:.1%}")
             
             return pot
             
         except Exception as e:
             logger.error(f"Error predicting PoT: {e}")
+            logger.warning("Falling back to analytical approximation")
             return self._analytical_pot(current_price, strike, dte, iv)
     
     def _analytical_pot(
@@ -229,6 +247,8 @@ class ProbabilityOfTouchModel:
         PoT ≈ 2 * N(d2) where d2 is from Black-Scholes
         
         Simplified: PoT ≈ CDF of normal distribution
+        
+        ⚠️ WARNING: This is NOT ML - just Black-Scholes approximation!
         """
         from scipy.stats import norm
         
@@ -236,6 +256,8 @@ class ProbabilityOfTouchModel:
         distance = abs(strike - current_price) / current_price
         time_factor = np.sqrt(dte / 365.0)
         vol_adjusted_distance = distance / (iv * time_factor) if iv > 0 and dte > 0 else 0
+        
+        logger.debug(f"⚙️  Analytical PoT: distance={distance:.2%}, vol_adj={vol_adjusted_distance:.2f}")
         
         # Simplified PoT
         pot = 2 * (1 - norm.cdf(vol_adjusted_distance))

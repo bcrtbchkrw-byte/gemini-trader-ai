@@ -34,13 +34,27 @@ class RegimeClassifier:
         self.model = None
         self.scaler = None
         self.feature_importance = {}
+        self.mode = 'UNKNOWN'  # Track current mode: ML or RULE_BASED
+        self.fallback_warning_shown = False
         
         # Try to load existing model
         if self.model_path.exists():
             self.load_model()
-        else:
-            logger.warning(f"No trained model found at {model_path}")
-            logger.info("Regime classifier will use rule-based fallback until trained")
+            if self.model is not None:
+                self.mode = 'ML'
+                logger.info("✅ RegimeClassifier: Running in ML mode")
+        
+        if self.model is None:
+            self.mode = 'RULE_BASED'
+            logger.error("")
+            logger.error("="*70)
+            logger.error("⚠️  WARNING: RegimeClassifier - NO TRAINED MODEL FOUND")
+            logger.error(f"   Model path: {model_path}")
+            logger.error("   🔴 RUNNING IN RULE-BASED FALLBACK MODE")
+            logger.error("   This uses simple if/else rules instead of ML")
+            logger.error("   TO FIX: Run python -m ml.scripts.prepare_ml_training_pipeline")
+            logger.error("="*70)
+            logger.error("")
     
     def train(
         self,
@@ -141,6 +155,9 @@ class RegimeClassifier:
         """
         if self.model is None or self.scaler is None:
             # Fallback to rule-based
+            if not self.fallback_warning_shown:
+                logger.warning("🔴 Using RULE-BASED fallback (no ML model)")
+                self.fallback_warning_shown = True
             return self._rule_based_fallback(features)
         
         try:
@@ -158,12 +175,13 @@ class RegimeClassifier:
             regime = self.REGIMES[pred_class]
             confidence = pred_proba[pred_class]
             
-            logger.debug(f"Regime: {regime} ({confidence:.1%} confidence)")
+            logger.debug(f"✨ ML Regime: {regime} ({confidence:.1%} confidence)")
             
             return regime, float(confidence)
             
         except Exception as e:
             logger.error(f"Error predicting regime: {e}")
+            logger.warning("Falling back to rule-based regime detection")
             return self._rule_based_fallback(features)
     
     def _rule_based_fallback(
@@ -173,10 +191,14 @@ class RegimeClassifier:
         """
         Fallback to simple rule-based regime detection
         Uses VIX and returns features
+        
+        ⚠️ WARNING: This is NOT ML - just simple if/else rules!
         """
         # Assume feature[0] = VIX, feature[5] = returns_1d
         vix = features[0] if len(features) > 0 else 15.0
         returns_1d = features[5] if len(features) > 5 else 0.0
+        
+        logger.debug(f"⚙️  Rule-based: VIX={vix:.1f}, returns={returns_1d:.3f}")
         
         if vix > 30:
             return 'EXTREME_STRESS', 0.8
