@@ -2,7 +2,8 @@
 IBKR Connection Manager
 Handles connection to TWS or IB Gateway with auto-reconnect logic.
 """
-from typing import Optional
+import asyncio
+from typing import Optional, Dict
 from ib_insync import IB, util
 from loguru import logger
 from config import get_config
@@ -34,12 +35,17 @@ class IBKRConnection:
                 if not self.ib.isConnected():
                     logger.info(f"Connecting to IBKR (Attempt {attempt + 1}/{max_retries})...")
                     await self.ib.connectAsync(
-                        self.config.ibkr.host,
-                        self.config.ibkr.port,
-                        clientId=self.config.ibkr.client_id
+                        self.config.host,
+                        self.config.port,
+                        clientId=self.config.client_id
                     )
                     self._connected = True
                     logger.info("✅ Connected to IBKR")
+                    
+                    # Request Real-Time Data (Type 1)
+                    # This tells IBKR we prefer live data. If not available, it might send delayed (Type 3).
+                    # We will check the data type on each request to enforce safety.
+                    self.ib.reqMarketDataType(1)
                     
                     # Verify account
                     await self._verify_account()

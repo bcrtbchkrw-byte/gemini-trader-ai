@@ -21,7 +21,9 @@ class Position:
         contracts: int,
         entry_credit: float,
         max_risk: float,
-        legs: List[Dict[str, Any]]
+        legs: List[Dict[str, Any]],
+        trailing_stop_enabled: bool = True,
+        trailing_profit_enabled: bool = True
     ):
         self.position_id = position_id
         self.symbol = symbol
@@ -33,10 +35,25 @@ class Position:
         self.max_risk = max_risk
         self.legs = legs
         
-        # Calculate targets
+        # NEW: Trailing exit settings
+        self.trailing_stop_enabled = trailing_stop_enabled
+        self.trailing_profit_enabled = trailing_profit_enabled
+        
+        # Calculate initial static targets (fallback)
         self.profit_target = entry_credit * 0.5  # 50% of max profit
         self.stop_loss = entry_credit * 2.5  # 2.5x credit
         self.time_exit_dte = 7  # Close at 7 DTE
+        
+        # NEW: Trailing levels (initialized with static values)
+        self.trailing_stop = self.stop_loss
+        self.trailing_profit = self.profit_target
+        
+        # NEW: Tracking for ML
+        self.highest_profit_seen = 0.0
+        self.ml_last_update = None
+        self.ml_confidence = 0.0
+        self.stop_multiplier = 2.5  # Current multiplier
+        self.profit_target_pct = 0.5  # Current target %
     
     @property
     def days_to_expiration(self) -> int:
@@ -48,34 +65,135 @@ class Position:
         """Days since entry"""
         return (datetime.now() - self.entry_date).days
     
-    def should_exit(self, current_price: float) -> Dict[str, Any]:
+    def update_trailing_levels(self, current_price: float, market_data: Dict[str, Any] = None) -> bool:
         """
-        Determine if position should be exited
+        Update trailing stop and profit levels using ML model
+        
+        Args:
+            current_price: Current spread price
+            market_data: Current market conditions (VIX, regime, etc.)
+            
+        Returns:
+            True if levels were updated
+        """
+        try:
+            from ml.exit_strategy_ml import get_exit_strategy_ml
+            from ml.feature_engineering import get_feature_engineering
+            
+            # Get ML model
+            ml_model = get_exit_strategy_ml()
+            
+            if ml_model.mode != 'ML':
+                # ML not available, use static levels
+                return False
+            
+            # Track highest profit
+            current_pnl = (self.entry_credit - current_price) * self.contracts * 100
+            if current_pnl > self.highest_profit_seen:
+                self.highest_profit_seen = current_pnl
+            
+            # Prepare features
+            feature_eng = get_feature_engineering()
+            
+            position_data = {
+                'entry_credit': self.entry_credit,
+                'max_risk': self.max_risk,
+                'contracts': self.contracts,
+                'entry_date': self.entry_date,
+                'expiration': self.expiration,
+                'vix_entry': 18.0,  # TODO: Store at entry
+                'delta_entry': 0.2,  # TODO: Store at entry
+                'theta_entry': 1.5,  # TODO: Store at entry
+                'iv_entry': 0.3,  # TODO: Store at entry
+                'highest_profit_seen': self.highest_profit_seen
+            }
+            
+            features = feature_eng.extract_exit_features(
+                position_data=position_data,
+                current_price=current_price,
+                market_data=market_data
+            )
+            
+            # Get ML prediction
+            prediction = ml_model.predict_exit_levels(
+                features=features,
+                entry_credit=self.entry_credit,
+                current_stop=self.trailing_stop,
+                current_profit=self.trailing_profit
+            )
+            
+            # Update levels if confidence is high enough
+            if prediction['confidence'] >= 0.5:
+                old_stop = self.trailing_stop
+                old_profit = self.trailing_profit
+                
+                # Only tighten stops, never widen
+                if self.trailing_stop_enabled:
+                    self.trailing_stop = min(prediction['trailing_stop'], self.trailing_stop)
+                    self.stop_multiplier = prediction['stop_multiplier']
+                
+                # Can adjust profit target both ways
+                if self.trailing_profit_enabled:
+                    self.trailing_profit = prediction['trailing_profit']
+                    self.profit_target_pct = prediction['profit_target_pct']
+                
+                self.ml_confidence = prediction['confidence']
+                self.ml_last_update = datetime.now()
+                
+                logger.debug(
+                    f"ML Exit Update [{self.symbol}]: "
+                    f"Stop: ${old_stop:.2f}→${self.trailing_stop:.2f}, "
+                    f"Profit: ${old_profit:.2f}→${self.trailing_profit:.2f}, "
+                    f"Confidence: {self.ml_confidence:.1%}"
+                )
+                
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.warning(f"Error updating trailing levels: {e}")
+            return False
+    
+    def should_exit(self, current_price: float, market_data: Dict[str, Any] = None) -> Dict[str, Any]:
+        """
+        Determine if position should be exited (ML-enhanced)
         
         Args:
             current_price: Current price of the spread
+            market_data: Market data for ML updates
             
         Returns:
             Dict with exit decision and reason
         """
-        # Profit target (50% max profit)
-        if current_price <= self.profit_target:
+        # Update trailing levels with ML (if enabled)
+        if (self.trailing_stop_enabled or self.trailing_profit_enabled) and market_data:
+            self.update_trailing_levels(current_price, market_data)
+        
+        # Use trailing levels (will be ML-adjusted if available)
+        target = self.trailing_profit if self.trailing_profit_enabled else self.profit_target
+        stop = self.trailing_stop if self.trailing_stop_enabled else self.stop_loss
+        
+        # Profit target
+        if current_price <= target:
             return {
                 'should_exit': True,
-                'reason': 'PROFIT_TARGET',
+                'reason': 'TRAILING_PROFIT' if self.trailing_profit_enabled else 'PROFIT_TARGET',
                 'current_price': current_price,
-                'target': self.profit_target,
-                'pnl': (self.entry_credit - current_price) * self.contracts * 100
+                'target': target,
+                'pnl': (self.entry_credit - current_price) * self.contracts * 100,
+                'ml_confidence': self.ml_confidence
             }
         
-        # Stop loss (2.5x credit)
-        if current_price >= self.stop_loss:
+        # Stop loss
+        if current_price >= stop:
             return {
                 'should_exit': True,
-                'reason': 'STOP_LOSS',
+                'reason': 'TRAILING_STOP' if self.trailing_stop_enabled else 'STOP_LOSS',
                 'current_price': current_price,
-                'stop': self.stop_loss,
-                'pnl': (self.entry_credit - current_price) * self.contracts * 100
+                'stop': stop,
+                'pnl': (self.entry_credit - current_price) * self.contracts * 100,
+                'ml_confidence': self.ml_confidence
             }
         
         # Time-based exit (7 DTE)
@@ -89,13 +207,117 @@ class Position:
             }
         
         # Hold position
-        return {
+        hold_decision = {
             'should_exit': False,
             'reason': 'HOLD',
             'current_price': current_price,
-            'profit_distance': (current_price - self.profit_target) / self.entry_credit,
-            'dte': self.days_to_expiration
+            'profit_distance': (current_price - target) / self.entry_credit,
+            'dte': self.days_to_expiration,
+            'trailing_stop': stop,
+            'trailing_profit': target
         }
+        
+        # AI Override Check (for large P/L moves)
+        if market_data:
+            try:
+                from config import get_config
+                
+                config = get_config()
+                
+                # Check if AI analysis should be triggered
+                if config.exit_strategy.ai_analysis_on_large_moves:
+                    current_pnl = (self.entry_credit - current_price) * self.contracts * 100
+                    max_risk = self.max_risk * self.contracts * 100
+                    
+                    # Calculate P/L ratio
+                    pnl_ratio = abs(current_pnl / max_risk) if max_risk > 0 else 0
+                    
+                    # Trigger AI if P/L ratio exceeds threshold
+                    if pnl_ratio >= config.exit_strategy.ai_trigger_pnl_threshold:
+                        logger.info(
+                            f"🤖 Large P/L move detected ({pnl_ratio:.1%}) - "
+                            f"requesting AI analysis for {self.symbol}"
+                        )
+                        
+                        # Get AI analysis (async, so we'll need to import asyncio)
+                        import asyncio
+                        from ai.gemini_client import get_gemini_client
+                        
+                        # Prepare position data for AI
+                        position_data = {
+                            'symbol': self.symbol,
+                            'strategy': self.strategy,
+                            'entry_credit': self.entry_credit,
+                            'entry_date': self.entry_date.isoformat(),
+                            'expiration': self.expiration.isoformat(),
+                            'days_in_trade': self.days_in_trade,
+                            'dte': self.days_to_expiration,
+                            'max_risk': self.max_risk
+                        }
+                        
+                        # ML recommendation
+                        ml_recommendation = {
+                            'trailing_stop': self.trailing_stop,
+                            'trailing_profit': self.trailing_profit,
+                            'stop_multiplier': self.stop_multiplier,
+                            'profit_target_pct': self.profit_target_pct,
+                            'confidence': self.ml_confidence,
+                            'mode': 'ML' if self.ml_confidence > 0 else 'RULE_BASED'
+                        }
+                        
+                        # Get Gemini client and analyze
+                        gemini = get_gemini_client()
+                        
+                        # Run async analysis
+                        ai_result = asyncio.run(gemini.analyze_exit_strategy(
+                            position=position_data,
+                            current_pnl=current_pnl,
+                            current_price=current_price,
+                            market_data=market_data,
+                            ml_recommendation=ml_recommendation
+                        ))
+                        
+                        if ai_result.get('success'):
+                            analysis = ai_result.get('analysis', {})
+                            alt_rec = analysis.get('alternative_recommendation', {})
+                            
+                            # Check if AI disagrees and recommends EXIT
+                            if not analysis.get('agree_with_ml', True):
+                                action = alt_rec.get('action', 'HOLD')
+                                
+                                if action == 'EXIT_NOW':
+                                    logger.warning(
+                                        f"⚠️  AI OVERRIDE: Recommends immediate exit for {self.symbol}\n"
+                                        f"   Reason: {analysis.get('reasoning', 'Unknown')}"
+                                    )
+                                    
+                                    # Override to exit
+                                    return {
+                                        'should_exit': True,
+                                        'reason': 'AI_OVERRIDE_EXIT',
+                                        'current_price': current_price,
+                                        'pnl': current_pnl,
+                                        'ai_reasoning': analysis.get('reasoning'),
+                                        'ai_confidence': analysis.get('confidence', 0)
+                                    }
+                                
+                                elif action in ['TIGHTEN_STOP', 'ADJUST_PROFIT']:
+                                    logger.info(
+                                        f"💡 AI suggests adjustments for {self.symbol}: {action}"
+                                    )
+                                    # Log but don't override - let ML handle adjustments
+                                    hold_decision['ai_suggestion'] = action
+                                    hold_decision['ai_reasoning'] = analysis.get('reasoning')
+                            
+                            else:
+                                logger.info(f"✅ AI agrees with ML recommendation for {self.symbol}")
+                                hold_decision['ai_confirmed'] = True
+                        
+            except Exception as e:
+                logger.warning(f"Error in AI override check: {e}")
+                # Don't fail exit decision due to AI error
+        
+        return hold_decision
 
 
 class ExitManager:
@@ -126,7 +348,17 @@ class ExitManager:
                 exit_price REAL,
                 exit_reason TEXT,
                 pnl REAL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                -- NEW: ML Exit Strategy Fields
+                trailing_stop_enabled INTEGER DEFAULT 1,
+                trailing_profit_enabled INTEGER DEFAULT 1,
+                highest_profit_seen REAL DEFAULT 0.0,
+                current_trailing_stop REAL,
+                current_trailing_profit REAL,
+                ml_last_update TEXT,
+                ml_confidence REAL DEFAULT 0.0,
+                stop_multiplier REAL DEFAULT 2.5,
+                profit_target_pct REAL DEFAULT 0.5
             )
         """)
         
@@ -144,7 +376,24 @@ class ExitManager:
             )
         """)
         
-        logger.info("Position tracking tables created")
+        # NEW: Track exit level adjustments over time
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS exit_adjustments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                position_id INTEGER NOT NULL,
+                timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+                adjustment_type TEXT NOT NULL,
+                old_stop REAL,
+                new_stop REAL,
+                old_profit REAL,
+                new_profit REAL,
+                reason TEXT,
+                confidence REAL,
+                FOREIGN KEY (position_id) REFERENCES positions(id)
+            )
+        """)
+        
+        logger.info("Position tracking tables created (with ML exit fields)")
     
     async def open_position(
         self,
@@ -610,7 +859,7 @@ class ExitManager:
     
     async def monitor_exits(self) -> List[Dict[str, Any]]:
         """
-        Check all open positions for exit signals
+        Check all open positions for exit signals (ML-enhanced)
         
         Returns:
             List of positions that should be exited
@@ -618,21 +867,61 @@ class ExitManager:
         positions = await self.get_open_positions()
         exit_signals = []
         
+        # Get current market data for ML
+        try:
+            from ml.regime_classifier import get_regime_classifier
+            
+            regime_classifier = get_regime_classifier()
+            
+            # TODO: Fetch real VIX from IBKR
+            current_vix = 17.0  # Placeholder
+            
+            # Predict regime
+            features = np.array([current_vix, 450.0, 0.3, 0.25, 50.0, 0.005, 0.01])  # Simplified
+            regime, regime_confidence = regime_classifier.predict_regime(features)
+            
+            market_data = {
+                'vix': current_vix,
+                'regime': regime,
+                'regime_confidence': regime_confidence
+            }
+            
+        except Exception as e:
+            logger.warning(f"Could not fetch market data for ML: {e}")
+            market_data = None
+        
         for position in positions:
             # TODO: Fetch current price from IBKR
-            # For now, skip actual price check
+            # For now, we'll just check time-based exits
+            
             logger.info(
-                f"Monitoring {position.symbol}: DTE={position.days_to_expiration}, "
-                f"Days in trade={position.days_in_trade}"
+                f"Monitoring {position.symbol}: "
+                f"DTE={position.days_to_expiration}, "
+                f"Days in trade={position.days_in_trade}, "
+                f"ML enabled={position.trailing_stop_enabled or position.trailing_profit_enabled}"
             )
             
-            # Check time-based exit
+            # If we have market data and a current price, check ML-enhanced exits
+            # Otherwise, fall back to time-based only
+            if market_data:
+                # Simulate checking with ML (would need real price from IBKR)
+                # For now, just log that ML would be used
+                logger.debug(
+                    f"ML exit monitoring for {position.symbol}: "
+                    f"Regime={market_data['regime']}, VIX={market_data['vix']:.1f}"
+                )
+            
+            # Check time-based exit (always works even without current price)
             if position.days_to_expiration <= position.time_exit_dte:
                 exit_signals.append({
                     'position': position,
                     'reason': 'TIME_EXIT',
-                    'dte': position.days_to_expiration
+                    'dte': position.days_to_expiration,
+                    'ml_enabled': position.trailing_stop_enabled or position.trailing_profit_enabled
                 })
+        
+        if exit_signals:
+            logger.info(f"Found {len(exit_signals)} positions ready to exit")
         
         return exit_signals
 

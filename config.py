@@ -167,16 +167,54 @@ class CircuitBreakerConfig:
 
 
 @dataclass
-class ExitParams:
-    """Exit strategy parameters"""
+class ExitStrategyConfig:
+    """Exit strategy parameters - ML/AI Enhanced"""
+    # Static fallback targets
     take_profit_percent: float
     stop_loss_multiplier: float
     
+    # ML Settings
+    use_ml_exits: bool
+    ml_confidence_threshold: float
+    
+    # TTP Settings
+    trailing_profit_enabled: bool
+    min_profit_target: float
+    max_profit_target: float
+    
+    # TSL Settings
+    trailing_stop_enabled: bool
+    min_stop_multiplier: float
+    max_stop_multiplier: float
+    
+    # AI Override
+    ai_analysis_on_large_moves: bool
+    ai_trigger_pnl_threshold: float
+    
     @classmethod
-    def from_env(cls) -> 'ExitParams':
+    def from_env(cls) -> 'ExitStrategyConfig':
         return cls(
+            # Static fallback
             take_profit_percent=float(os.getenv('TAKE_PROFIT_PERCENT', '50')),
-            stop_loss_multiplier=float(os.getenv('STOP_LOSS_MULTIPLIER', '2.5'))
+            stop_loss_multiplier=float(os.getenv('STOP_LOSS_MULTIPLIER', '2.5')),
+            
+            # ML
+            use_ml_exits=os.getenv('USE_ML_EXITS', 'true').lower() == 'true',
+            ml_confidence_threshold=float(os.getenv('ML_CONFIDENCE_THRESHOLD', '0.6')),
+            
+            # TTP
+            trailing_profit_enabled=os.getenv('TRAILING_PROFIT_ENABLED', 'true').lower() == 'true',
+            min_profit_target=float(os.getenv('MIN_PROFIT_TARGET', '0.4')),
+            max_profit_target=float(os.getenv('MAX_PROFIT_TARGET', '0.7')),
+            
+            # TSL
+            trailing_stop_enabled=os.getenv('TRAILING_STOP_ENABLED', 'true').lower() == 'true',
+            min_stop_multiplier=float(os.getenv('MIN_STOP_MULTIPLIER', '1.5')),
+            max_stop_multiplier=float(os.getenv('MAX_STOP_MULTIPLIER', '3.5')),
+            
+            # AI
+            ai_analysis_on_large_moves=os.getenv('AI_EXIT_ANALYSIS', 'true').lower() == 'true',
+            ai_trigger_pnl_threshold=float(os.getenv('AI_EXIT_PNL_THRESHOLD', '0.3'))
         )
 
 
@@ -200,13 +238,15 @@ class SafetyParams:
     earnings_blackout_hours: int
     paper_trading: bool
     auto_execute: bool
+    allow_delayed_data: bool
     
     @classmethod
     def from_env(cls) -> 'SafetyParams':
         return cls(
             earnings_blackout_hours=int(os.getenv('EARNINGS_BLACKOUT_HOURS', '48')),
             paper_trading=os.getenv('PAPER_TRADING', 'true').lower() == 'true',
-            auto_execute=os.getenv('AUTO_EXECUTE', 'false').lower() == 'true'
+            auto_execute=os.getenv('AUTO_EXECUTE', 'false').lower() == 'true',
+            allow_delayed_data=os.getenv('ALLOW_DELAYED_DATA', 'false').lower() == 'true'
         )
 
 
@@ -252,9 +292,9 @@ class Config:
     circuit_breaker: CircuitBreakerConfig
     order_ttl: OrderTTLConfig
     dividend: DividendConfig
-    exit_params: ExitParams
+    exit_strategy: ExitStrategyConfig  # UPDATED: Renamed from exit_params
     safety: SafetyParams
-    logging: LogConfig # Added this field based on the original __init__
+    logging: LogConfig
     
     def __init__(self):
         self.ibkr = IBKRConfig.from_env()
@@ -266,7 +306,7 @@ class Config:
         self.circuit_breaker = CircuitBreakerConfig.from_env()
         self.order_ttl = OrderTTLConfig.from_env()
         self.dividend = DividendConfig.from_env()
-        self.exit_params = ExitParams.from_env()
+        self.exit_strategy = ExitStrategyConfig.from_env()  # UPDATED
         self.safety = SafetyParams.from_env()
         self.logging = LogConfig.from_env()
     
@@ -284,7 +324,7 @@ class Config:
             errors.append("Max allocation percent cannot exceed 100%")
         
         # Validate VIX thresholds
-        if not (self.vix_regimes.normal_threshold < self.vix_regimes.high_threshold < self.vix_regimes.panic_threshold):
+        if not (self.vix.normal_threshold < self.vix.high_threshold < self.vix.panic_threshold):
             errors.append("VIX thresholds must be in ascending order: normal < high < panic")
         
         # Validate Greeks thresholds

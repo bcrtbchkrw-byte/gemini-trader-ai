@@ -163,10 +163,23 @@ class GeminiTraderAI:
             logger.info("📊 PHASE 1: Stock Pre-Check")
             logger.info("-" * 60)
             
+            # Calculate dynamic max price based on account size
+            # Ensure we don't trade stocks too expensive for the account
+            account_size = self.config.trading.account_size
+            max_price_limit = 300.0  # Default hard cap
+            
+            if account_size:
+                # For small accounts, limit stock price to account size to ensure affordability
+                # This prevents trading TSLA ($350+) on a $200 account
+                dynamic_limit = float(account_size)
+                max_price_limit = min(300.0, dynamic_limit)
+                
+                logger.info(f"💰 Account-Aware Screening: Max stock price limited to ${max_price_limit:.2f} (Account: ${account_size:.2f})")
+            
             screener = get_stock_screener()
             criteria = ScreeningCriteria(
                 min_price=20,
-                max_price=300,
+                max_price=max_price_limit,
                 min_daily_volume=1_000_000,
                 vix_regime=regime
             )
@@ -226,6 +239,14 @@ class GeminiTraderAI:
             logger.info("🤖 PHASE 2: Gemini Fundamental Analysis + News")
             logger.info("-" * 60)
             
+            # Fetch Polymarket Data (Wisdom of the Crowd)
+            from analysis.polymarket_client import get_polymarket_client
+            polymarket = get_polymarket_client()
+            
+            logger.info("🔮 Fetching Polymarket signals...")
+            macro_context = await polymarket.get_macro_context()
+            crypto_sentiment = await polymarket.get_crypto_sentiment()
+            
             # Fetch news for all candidates
             news_fetcher = get_news_fetcher()
             news_context = await news_fetcher.fetch_batch(
@@ -236,7 +257,11 @@ class GeminiTraderAI:
             gemini_result = await self.gemini.batch_analyze_with_news(
                 candidates=candidates,
                 news_context=news_context,
-                vix=vix
+                vix=vix,
+                polymarket_data={
+                    'macro': macro_context,
+                    'crypto': crypto_sentiment
+                }
             )
             
             if not gemini_result['success']:
@@ -314,11 +339,24 @@ class GeminiTraderAI:
                         'impl_vol': options_data[0].get('impliedVolatility', 0),
                     }
                     
+                    # Calculate Max Pain
+                    from analysis.max_pain import get_max_pain_calculator
+                    max_pain_calc = get_max_pain_calculator()
+                    max_pain = 0.0
+                    
+                    # Use expiration from first option
+                    expiration = options_data[0].get('expiration')
+                    if expiration:
+                        logger.info(f"   📊 Calculating Max Pain for {expiration}...")
+                        chain_oi = await data_fetcher.get_chain_open_interest(symbol, expiration)
+                        max_pain = max_pain_calc.calculate_max_pain(chain_oi)
+                    
                     # Claude strategy analysis with confidence scoring
                     claude_result = await self.claude.analyze_strategy(
                         stock_data=stock_data,
                         options_data=greeks_data,
-                        strategy_type="CREDIT_SPREAD"  # Or detect from options_data
+                        strategy_type="CREDIT_SPREAD",
+                        max_pain=max_pain  # Pass Max Pain to AI
                     )
                     
                     # Extract confidence and decision

@@ -64,7 +64,8 @@ DŮLEŽITÉ: Odpověz POUZE ve formátu JSON (pro úsporu tokenů). Struktura:
 def get_gemini_batch_analysis_prompt(
     candidates: list,
     news_context: Dict[str, list],
-    vix: float
+    vix: float,
+    polymarket_data: Optional[Dict[str, Any]] = None
 ) -> str:
     """
     Generate prompt for Gemini batch analysis (Phase 2)
@@ -73,10 +74,34 @@ def get_gemini_batch_analysis_prompt(
         candidates: List of stock candidates from Phase 1
         news_context: Dict mapping symbol to news articles
         vix: Current VIX value
+        polymarket_data: Optional data from prediction markets
         
     Returns:
         Formatted prompt for batch analysis
     """
+    # Format Polymarket data
+    poly_text = ""
+    if polymarket_data:
+        poly_text = "\n**Prediction Markets (Wisdom of the Crowd):**\n"
+        
+        # Macro
+        macro = polymarket_data.get('macro', {})
+        if macro:
+            poly_text += "- Macro Sentiment:\n"
+            for k, v in macro.items():
+                prob = v.get('probability', 0)
+                poly_text += f"  • {k}: {prob:.1%} ({v.get('question')})\n"
+                
+        # Crypto
+        crypto = polymarket_data.get('crypto', {})
+        if crypto:
+            poly_text += "- Crypto Sentiment:\n"
+            for k, markets in crypto.items():
+                poly_text += f"  • {k}:\n"
+                for m in markets[:2]: # Top 2 per coin
+                    prob = m.get('probability', 0)
+                    poly_text += f"    - {m.get('question')}: {prob:.1%}\n"
+    
     # Format candidates
     stocks_text = ""
     for i, candidate in enumerate(candidates, 1):
@@ -98,6 +123,7 @@ def get_gemini_batch_analysis_prompt(
 
 **Context**:
 - VIX: {vix:.2f}
+{poly_text}
 - Účel: Vybrat 2-3 nejlepší akcie pro options trading (malý účet ~$200)
 
 **Kandidáti z Phase 1** (prošly filtrem cena, likvidita, IV rank):
@@ -139,7 +165,8 @@ def get_claude_greeks_analysis_prompt(
     vix: float,
     regime: str,
     account_size: float,
-    max_risk: float
+    max_risk: float,
+    max_pain: Optional[float] = None
 ) -> str:
     """
     Generate prompt for Claude Greeks analysis and trade recommendation
@@ -152,6 +179,7 @@ def get_claude_greeks_analysis_prompt(
         regime: Current VIX regime
         account_size: Account size in USD
         max_risk: Max risk per trade
+        max_pain: Max Pain strike price (optional)
         
     Returns:
         Formatted prompt with your trading rules requesting JSON response
@@ -167,6 +195,8 @@ def get_claude_greeks_analysis_prompt(
         for opt in options_data[:10]  # Limit to top 10
     ])
     
+    max_pain_text = f"- Max Pain Strike: ${max_pain:.2f}" if max_pain else "- Max Pain: N/A"
+    
     prompt = f"""Jsi "Gemini-Trader 5.1", elitní opční stratég a risk manager.
 
 **Kontext**: Spravuješ "Micro Margin Account" (${account_size:.0f}) u IBKR. Máš k dispozici real-time data přes API.
@@ -180,6 +210,7 @@ def get_claude_greeks_analysis_prompt(
 **Aktuální stav trhu:**
 - VIX: {vix:.2f}
 - Regime: {regime}
+{max_pain_text}
 
 **VIX pravidla:**
 - VIX > 30 (PANIC): 🛑 HARD STOP. Zákaz nových Credit pozic.
@@ -229,6 +260,17 @@ def get_claude_greeks_analysis_prompt(
    - Best: Z-score > 2 (price extreme)
    - Signal: Price reverting to mean
    - Entry: Sell spreads in reversion direction
+    
+    **ADVANCED INCOME:**
+    8. **POOR_MANS_COVERED_CALL** (PMCC) - Long deep ITM LEAPS Call + Short OTM Call
+       - Best: Bullish outlook, low capital requirement vs stock
+       - Setup: Buy >0.80 Delta LEAPS (>6 months), Sell <0.30 Delta Call (<45 days)
+       - Risk: Debit paid (max loss)
+       
+    9. **JADE_LIZARD** - Short Put + Short Call Spread
+       - Best: Neutral to slightly bullish, high IV
+       - Setup: Sell OTM Put, Sell OTM Call Spread (Credit > Call Spread Width)
+       - Goal: No upside risk if credit > spread width
 
 ---
 
@@ -387,3 +429,171 @@ def parse_claude_response(response_text: str) -> Dict[str, Any]:
             'reasoning': response_text,
             'error': 'Failed to parse JSON response'
         }
+
+
+def get_exit_strategy_analysis_prompt(
+    position: Dict[str, Any],
+    current_pnl: float,
+    current_price: float,
+    market_data: Dict[str, Any],
+    ml_recommendation: Dict[str, Any]
+) -> str:
+    """
+    Generate prompt for AI exit strategy analysis
+    
+    Provides "second opinion" on ML recommendations,
+    especially for large P/L moves
+    
+    Args:
+        position: Position details (symbol, entry, etc.)
+        current_pnl: Current P/L in dollars
+        current_price: Current spread price
+        market_data: Current market conditions
+        ml_recommendation: ML model's suggested exit levels
+        
+    Returns:
+        Formatted prompt for Gemini AI
+    """
+    symbol = position.get('symbol', 'UNKNOWN')
+    strategy = position.get('strategy', 'UNKNOWN')
+    entry_credit = position.get('entry_credit', 0)
+    entry_date = position.get('entry_date', 'Unknown')
+    expiration = position.get('expiration', 'Unknown')
+    days_in_trade = position.get('days_in_trade', 0)
+    dte = position.get('dte', 0)
+    
+    # Calculate P/L metrics
+    pnl_pct = (current_pnl / (entry_credit * 100)) * 100 if entry_credit > 0 else 0
+    max_risk = position.get('max_risk', entry_credit)
+    risk_ratio = current_pnl / (max_risk * 100) if max_risk > 0 else 0
+    
+    # Market context
+    vix = market_data.get('vix', 'Unknown')
+    regime = market_data.get('regime', 'Unknown')
+    
+    # ML recommendation
+    ml_stop = ml_recommendation.get('trailing_stop', 'N/A')
+    ml_profit = ml_recommendation.get('trailing_profit', 'N/A')
+    ml_confidence = ml_recommendation.get('confidence', 0)
+    ml_mode = ml_recommendation.get('mode', 'Unknown')
+    
+    prompt = f"""Analyzuj současnou situaci open pozice a poskytni doporučení pro exit strategii.
+
+## Pozice Info
+
+- **Symbol**: {symbol}
+- **Strategie**: {strategy}
+- **Entry Credit**: ${entry_credit:.2f} per contract
+- **Entry Date**: {entry_date}
+- **Expiration**: {expiration}
+- **Days in Trade**: {days_in_trade}
+- **DTE**: {dte}
+
+## Současná Situace
+
+- **Current Price**: ${current_price:.2f}
+- **Current P/L**: ${current_pnl:.2f} ({pnl_pct:+.1f}%)
+- **Risk Ratio**: {risk_ratio:.2%} (P/L vs Max Risk)
+
+## Market Kontext
+
+- **VIX**: {vix}
+- **Market Regime**: {regime}
+
+## ML Model Doporučení
+
+**Mode**: {ml_mode}  
+**Confidence**: {ml_confidence:.1%}
+
+- **Suggested Trailing Stop**: ${ml_stop}
+- **Suggested Trailing Profit**: ${ml_profit}
+
+## Tvůj Úkol
+
+Poskytni **second opinion** na ML doporučení. Zvaž:
+
+1. **P/L Momentum**: Je pozice konzistentně profitable nebo volatilní?
+2. **Market Risk**: Jaké jsou aktuální market risks vzhledem k regime?
+3. **Time Decay**: Je vhodné držet do expiration nebo exit dříve?
+4. **ML Sanity Check**: Dávají ML poziční smysl v kontextu?
+
+**DŮLEŽITÉ**: Odpověz POUZE JSON:
+
+{{
+  "agree_with_ml": true/false,
+  "reasoning": "stručné zdůvodnění proč souhlasíš/nesouhlasíš",
+  "alternative_recommendation": {{
+    "action": "HOLD|EXIT_NOW|TIGHTEN_STOP|ADJUST_PROFIT",
+    "trailing_stop": null nebo nová hodnota,
+    "trailing_profit": null nebo nová hodnota,
+    "urgency": "LOW|MEDIUM|HIGH"
+  }},
+  "key_considerations": ["důvod 1", "důvod 2", "..."],
+  "confidence": 0.0-1.0
+}}
+
+Žádný další text.
+"""
+    
+    return prompt
+
+
+def get_rolling_analysis_prompt(
+    position: Dict[str, Any],
+    current_market_data: Dict[str, Any],
+    proposed_roll: Dict[str, Any]
+) -> str:
+    """
+    Generate prompt for AI analysis of rolling a position
+    
+    Args:
+        position: Current position details
+        current_market_data: Current market context (VIX, price, etc.)
+        proposed_roll: Details of the proposed roll (new expiration, strikes, credit)
+        
+    Returns:
+        Formatted prompt for AI
+    """
+    symbol = position.get('symbol', 'UNKNOWN')
+    strategy = position.get('strategy', 'UNKNOWN')
+    current_pnl = position.get('pnl', 0.0)
+    
+    prompt = f"""Analyzuj návrh na ROLLING pozice pro {symbol} ({strategy}).
+
+**Současná Pozice:**
+- Symbol: {symbol}
+- Strategie: {strategy}
+- P/L: ${current_pnl:.2f}
+- Expirace: {position.get('expiration', 'Unknown')}
+- Strikes: {position.get('strikes', 'Unknown')}
+
+**Market Context:**
+- Cena podkladu: ${current_market_data.get('price', 'N/A')}
+- VIX: {current_market_data.get('vix', 'N/A')}
+- Trend: {current_market_data.get('trend', 'Unknown')}
+
+**Navrhovaný Roll:**
+- Nová Expirace: {proposed_roll.get('new_expiration', 'Unknown')}
+- Nové Strikes: {proposed_roll.get('new_strikes', 'Unknown')}
+- Net Credit/Debit: ${proposed_roll.get('net_credit', 0.0)}
+
+**Tvůj Úkol:**
+Rozhodni, zda je rolling v tuto chvíli matematicky a strategicky výhodný.
+Odpověz na otázku: "Zlepšuje tento roll pravděpodobnost profitu, nebo jen oddaluje nevyhnutelnou ztrátu?"
+
+**Kritéria:**
+1. Získáme kredit za roll? (Pokud ne, je to ospravedlnitelné?)
+2. Zlepšujeme strike prices (např. posun OTM)?
+3. Je fundamentální teze stále platná?
+
+**Odpověz POUZE JSON:**
+{{
+  "recommendation": "APPROVE_ROLL|REJECT_ROLL",
+  "confidence": 0.0-1.0,
+  "reasoning": "stručné zdůvodnění",
+  "risk_assessment": "low/medium/high"
+}}
+"""
+    return prompt
+
+

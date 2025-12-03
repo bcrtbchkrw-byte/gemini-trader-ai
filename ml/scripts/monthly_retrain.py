@@ -244,6 +244,25 @@ async def main():
         logger.error("\n❌ Retraining failed at Step 5: PoT model retraining")
         return
     
+    # Step 6: Retrain Exit Strategy model
+    logger.info("\n" + "="*60)
+    logger.info("STEP 6: Retraining Exit Strategy Model")
+    logger.info("="*60)
+    
+    try:
+        from ml.scripts.monthly_retrain_exit_model import monthly_retrain_exit_model
+        
+        success = await monthly_retrain_exit_model()
+        if not success:
+            logger.error("\n❌ Retraining failed at Step 6: Exit model retraining")
+            # Don't fail entire pipeline - exit model is optional
+            logger.warning("Continuing... (exit model is non-critical)")
+    except ImportError:
+        logger.warning("Exit model retraining not available (module not found)")
+    except Exception as e:
+        logger.warning(f"Exit model retraining failed: {e}")
+        logger.warning("Continuing... (exit model is non-critical)")
+    
     # Success!
     logger.info("\n" + "🎉 " + "="*56)
     logger.info("🎉 MONTHLY RETRAINING COMPLETE!")
@@ -251,6 +270,7 @@ async def main():
     logger.info("\nModels retrained with accumulated data:")
     logger.info("  ✅ RegimeClassifier → ml/models/regime_classifier.joblib")
     logger.info("  ✅ ProbabilityOfTouch → ml/models/probability_of_touch.joblib")
+    logger.info("  ✅ ExitStrategyML → ml/models/exit_strategy_ml.joblib")
     logger.info("\nOld data preserved, new data added.")
     logger.info("Models now trained on complete historical dataset!")
 

@@ -104,7 +104,8 @@ class ClaudeClient:
         self,
         stock_data: Dict[str, Any],
         options_data: Dict[str, Any],
-        strategy_type: str
+        strategy_type: str,
+        max_pain: Optional[float] = None
     ) -> Dict[str, Any]:
         """
         Deep analysis with Claude and cost tracking
@@ -120,11 +121,14 @@ class ClaudeClient:
             stock_data: Stock market data
             options_data: Option Greeks and pricing
             strategy_type: e.g., "IRON_CONDOR", "VERTICAL_SPREAD"
+            max_pain: Max Pain strike price (optional)
             
         Returns:
             Analysis with confidence_score (1-10) and reasoning
         """
         try:
+            max_pain_text = f"- Max Pain Strike: ${max_pain:.2f}" if max_pain else "- Max Pain: N/A"
+            
             prompt = f"""You are analyzing a {strategy_type} options strategy for {stock_data['symbol']}.
 
 **CRITICAL: Provide a CONFIDENCE SCORE (1-10)**
@@ -140,6 +144,7 @@ Stock Data:
 - IV Rank: {stock_data.get('iv_rank', 'N/A')}
 - Volume: {stock_data.get('volume', 'N/A'):,}
 - Sector: {stock_data.get('sector', 'Unknown')}
+{max_pain_text}
 
 Option Greeks:
 - Delta: {options_data.get('delta', 'N/A')}
@@ -279,7 +284,8 @@ Format response as JSON:
         symbol: str,
         options_data: List[Dict[str, Any]],
         vix: float,
-        regime: str
+        regime: str,
+        max_pain: Optional[float] = None
     ) -> Dict[str, Any]:
         """
         Perform advanced Greeks analysis and generate trade recommendation
@@ -289,6 +295,7 @@ Format response as JSON:
             options_data: List of options with Greeks data
             vix: Current VIX value
             regime: Current VIX regime
+            max_pain: Max Pain strike price (optional)
             
         Returns:
             Dict with trade recommendation
@@ -308,7 +315,8 @@ Format response as JSON:
                 vix=vix,
                 regime=regime,
                 account_size=self.account_size,
-                max_risk=self.max_risk
+                max_risk=self.max_risk,
+                max_pain=max_pain
             )
             
             logger.info(f"Requesting Claude Greeks analysis for {symbol}...")

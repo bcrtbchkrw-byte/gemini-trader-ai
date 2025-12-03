@@ -8,7 +8,11 @@ from loguru import logger
 from datetime import datetime, date
 import os
 from config import get_config
-from ai.prompts import get_gemini_fundamental_prompt, parse_gemini_response
+from ai.prompts import (
+    get_gemini_fundamental_prompt,
+    parse_gemini_response,
+    get_exit_strategy_analysis_prompt
+)
 from data.logger import get_ai_logger
 
 
@@ -199,7 +203,8 @@ class GeminiClient:
         self,
         candidates: List[Dict[str, Any]],
         news_context: Dict[str, List[Dict]],
-        vix: float
+        vix: float,
+        polymarket_data: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Batch analyze stocks with news context and cost tracking
@@ -225,7 +230,8 @@ class GeminiClient:
             prompt = get_gemini_batch_analysis_prompt(
                 candidates=candidates,
                 news_context=news_context,
-                vix=vix
+                vix=vix,
+                polymarket_data=polymarket_data
             )
             
             # Generate response
@@ -270,6 +276,168 @@ class GeminiClient:
                 'success': False,
                 'error': str(e)
             }
+    
+    async def analyze_exit_strategy(
+        self,
+        position: Dict[str, Any],
+        current_pnl: float,
+        current_price: float,
+        market_data: Dict[str, Any],
+        ml_recommendation: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        AI analysis of exit strategy (second opinion on ML recommendation)
+        
+        Triggered for large P/L moves to provide human-readable assessment
+        
+        Args:
+            position: Position details
+            current_pnl: Current P/L in dollars
+            current_price: Current spread price
+            market_data: Market conditions (VIX, regime)
+            ml_recommendation: ML model's suggested levels
+            
+        Returns:
+            Dict with AI analysis and recommendation
+        """
+        # Check if we can make request
+        if not self.can_make_request():
+            logger.warning("⚠️  Gemini in SILENT MODE - skipping exit analysis")
+            return {
+                'success': False,
+                'error': 'Daily cost limit exceeded',
+                'silent_mode': True,
+                'agree_with_ml': True  # Default to ML when AI unavailable
+            }
+        
+        try:
+            from ai.prompts import get_exit_strategy_analysis_prompt
+            
+            symbol = position.get('symbol', 'Unknown')
+            logger.info(f"Requesting Gemini exit strategy analysis for {symbol}...")
+            
+            # Generate prompt
+            prompt = get_exit_strategy_analysis_prompt(
+                position=position,
+                current_pnl=current_pnl,
+                current_price=current_price,
+                market_data=market_data,
+                ml_recommendation=ml_recommendation
+            )
+            
+            # Get AI response
+            response = await self._generate_async(prompt)
+            
+            if not response:
+                logger.error("Failed to get exit analysis from Gemini")
+                return {
+                    'success': False,
+                    'error': 'No response from Gemini',
+                    'agree_with_ml': True  # Default to ML
+                }
+            
+            # Parse JSON response
+            import json
+            parsed = json.loads(response)
+            
+            # Log AI decision
+            self.ai_logger.info(
+                f"Gemini Exit Analysis - {symbol}\n"
+                f"Agree with ML: {parsed.get('agree_with_ml', 'N/A')}\n"
+                f"Recommended Action: {parsed.get('alternative_recommendation', {}).get('action', 'N/A')}\n"
+                f"Confidence: {parsed.get('confidence', 'N/A')}\n"
+                f"---\n{response}\n"
+            )
+            
+            logger.info(
+                f"✅ Gemini exit analysis complete for {symbol}: "
+                f"Agree={parsed.get('agree_with_ml', False)}, "
+                f"Action={parsed.get('alternative_recommendation', {}).get('action', 'HOLD')}"
+            )
+            
+            return {
+                'success': True,
+                'symbol': symbol,
+                'analysis': parsed,
+                'raw_response': response
+            }
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse Gemini exit analysis response: {e}")
+            return {
+                'success': False,
+                'error': 'Invalid JSON response',
+                'agree_with_ml': True
+            }
+        except Exception as e:
+            logger.error(f"Error in Gemini exit analysis: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'agree_with_ml': True
+            }
+
+    async def analyze_rolling_strategy(
+        self,
+        position: Dict[str, Any],
+        current_market_data: Dict[str, Any],
+        proposed_roll: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        AI analysis of rolling a position
+        
+        Args:
+            position: Current position details
+            current_market_data: Current market context
+            proposed_roll: Details of the proposed roll
+            
+        Returns:
+            Dict with AI analysis and recommendation
+        """
+        if not self.can_make_request():
+            logger.warning("⚠️  Gemini in SILENT MODE - skipping rolling analysis")
+            return {
+                'success': False,
+                'error': 'Daily cost limit exceeded',
+                'recommendation': 'REJECT_ROLL' # Conservative default
+            }
+            
+        try:
+            from ai.prompts import get_rolling_analysis_prompt
+            
+            symbol = position.get('symbol', 'Unknown')
+            logger.info(f"Requesting Gemini rolling analysis for {symbol}...")
+            
+            prompt = get_rolling_analysis_prompt(
+                position=position,
+                current_market_data=current_market_data,
+                proposed_roll=proposed_roll
+            )
+            
+            response = await self._generate_async(prompt)
+            
+            if not response:
+                return {'success': False, 'error': 'No response'}
+                
+            import json
+            parsed = json.loads(response)
+            
+            self.ai_logger.info(
+                f"Gemini Rolling Analysis - {symbol}\n"
+                f"Recommendation: {parsed.get('recommendation', 'N/A')}\n"
+                f"Confidence: {parsed.get('confidence', 'N/A')}\n"
+                f"---\n{response}\n"
+            )
+            
+            return {
+                'success': True,
+                'analysis': parsed,
+                'raw_response': response
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in Gemini rolling analysis: {e}")
+            return {'success': False, 'error': str(e)}
 
     async def _generate_async(self, prompt: str) -> Optional[str]:
         """

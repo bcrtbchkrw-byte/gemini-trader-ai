@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from ib_insync import Stock, Option, Index, Contract
 from loguru import logger
 from ibkr.connection import get_ibkr_connection
+from config import get_config
 
 
 class IBKRDataFetcher:
@@ -14,6 +15,44 @@ class IBKRDataFetcher:
     
     def __init__(self):
         self.connection = get_ibkr_connection()
+        self.config = get_config()
+        
+    def _validate_data_type(self, ticker, symbol: str) -> bool:
+        """
+        Validate that market data is Real-Time (Type 1) or Frozen (Type 2).
+        Reject Delayed (Type 3) or Delayed Frozen (Type 4) unless configured otherwise.
+        
+        Args:
+            ticker: IBKR Ticker object
+            symbol: Symbol being checked
+            
+        Returns:
+            bool: True if data is valid, False otherwise
+        """
+        # Market Data Types:
+        # 1 = Real-Time
+        # 2 = Frozen (at close)
+        # 3 = Delayed
+        # 4 = Delayed Frozen
+        
+        data_type = ticker.marketDataType
+        
+        if data_type in [1, 2]:
+            return True
+            
+        if data_type in [3, 4]:
+            if self.config.safety.allow_delayed_data:
+                logger.warning(f"⚠️  Using DELAYED data for {symbol} (Type {data_type}) - Allowed by config")
+                return True
+            else:
+                logger.error(f"🛑 BLOCKED: Received DELAYED data for {symbol} (Type {data_type}). Real-time data required.")
+                return False
+                
+        # Unknown type (0 or others) - usually means data hasn't arrived yet, but if we have a price, it's suspicious
+        if ticker.last or ticker.close:
+             logger.warning(f"⚠️  Unknown data type {data_type} for {symbol}")
+             
+        return True
     
     async def get_vix(self) -> Optional[float]:
         """
@@ -31,6 +70,11 @@ class IBKRDataFetcher:
             # Request market data
             ticker = ib.reqMktData(vix, '', False, False)
             await ib.sleep(2)  # Wait for data to arrive
+            
+            # Validate data type (Real-Time vs Delayed)
+            if not self._validate_data_type(ticker, 'VIX'):
+                ib.cancelMktData(vix)
+                return None
             
             if ticker.last and ticker.last > 0:
                 vix_value = ticker.last
@@ -368,6 +412,11 @@ class IBKRDataFetcher:
             ticker = ib.reqMktData(stock, '', False, False)
             await ib.sleep(2)
             
+            # Validate data type (Real-Time vs Delayed)
+            if not self._validate_data_type(ticker, symbol):
+                ib.cancelMktData(stock)
+                return None
+            
             price = ticker.last if ticker.last > 0 else ticker.close
             
             # Cancel market data
@@ -474,6 +523,11 @@ class IBKRDataFetcher:
             ticker = ib.reqMktData(contract, '106', False, False)  # 106 = option Greeks
             await ib.sleep(3)  # Wait for Greeks to arrive
             
+            # Validate data type (Real-Time vs Delayed)
+            if not self._validate_data_type(ticker, f"{contract.symbol} Option"):
+                ib.cancelMktData(contract)
+                return None
+            
             if not ticker.modelGreeks:
                 logger.warning(f"Greeks not available for {contract}")
                 ib.cancelMktData(contract)
@@ -483,7 +537,7 @@ class IBKRDataFetcher:
             underlying_price = ticker.last if ticker.last > 0 else ticker.close
             
             # Calculate precise Vanna using Black-Scholes
-            vanna = self._calculate_precise_vanna(
+            vanna = await self._calculate_precise_vanna(
                 contract=contract,
                 greeks=ticker.modelGreeks,
                 underlying_price=underlying_price
@@ -518,16 +572,14 @@ class IBKRDataFetcher:
             return None
     
     
-    def _calculate_precise_vanna(
+    async def _calculate_precise_vanna(
         self,
         contract: Contract,
         greeks,
         underlying_price: float
     ) -> Optional[float]:
         """
-        Calculate PRECISE Vanna using Black-Scholes analytical formula
-        
-        Uses full contract details (S, K, T, σ) for accurate calculation.
+        Calculate PRECISE Vanna using QuantLib (American) or Black-Scholes (European)
         
         Args:
             contract: Option contract with strike, expiration
@@ -542,6 +594,7 @@ class IBKRDataFetcher:
         
         try:
             from risk.vanna_calculator import get_vanna_calculator
+            from risk.quantlib_vanna import get_quantlib_vanna_calculator
             from datetime import datetime
             
             # Extract parameters
@@ -564,11 +617,35 @@ class IBKRDataFetcher:
                 logger.warning("Option already expired")
                 return None
             
-            # Get Vanna calculator
-            calc = get_vanna_calculator()
+            # Get risk-free rate (needed for QuantLib)
+            # We reuse the VannaCalculator to fetch the dynamic rate
+            calc_bs = get_vanna_calculator(ibkr_connection=self.connection)
+            r = await calc_bs._get_risk_free_rate()
             
-            # Method 1: Full analytical Black-Scholes (BEST)
-            vanna = calc.calculate_vanna(
+            # Try QuantLib (American Option)
+            try:
+                calc_ql = get_quantlib_vanna_calculator()
+                vanna = calc_ql.calculate_vanna(
+                    S=underlying_price,
+                    K=contract.strike,
+                    T=T,
+                    sigma=sigma,
+                    r=r,
+                    option_type='call' if contract.right == 'C' else 'put'
+                )
+                
+                if vanna is not None:
+                    logger.debug(
+                        f"Vanna (QuantLib American): {contract.symbol} {contract.strike}{contract.right} "
+                        f"= {vanna:.6f} (S={underlying_price:.2f}, σ={sigma:.2%}, r={r:.1%})"
+                    )
+                    return vanna
+                    
+            except Exception as e:
+                logger.warning(f"QuantLib Vanna calculation failed: {e}, falling back to BS")
+            
+            # Fallback: Analytical Black-Scholes (European)
+            vanna = await calc_bs.calculate_vanna(
                 S=underlying_price,
                 K=contract.strike,
                 T=T,
@@ -577,39 +654,19 @@ class IBKRDataFetcher:
             )
             
             if vanna is not None:
-                logger.debug(
-                    f"Vanna (analytical): {contract.symbol} {contract.strike}{contract.right} "
-                    f"= {vanna:.6f} (S={underlying_price:.2f}, σ={sigma:.2%}, T={T:.3f}y)"
-                )
                 return vanna
             
-            # Method 2: Fallback - from Vega
-            vanna = calc.calculate_vanna_from_vega(
-                vega=vega,
-                S=underlying_price,
-                K=contract.strike,
-                T=T,
-                sigma=sigma
-            )
-            
-            if vanna is not None:
-                logger.debug(f"Vanna (from Vega): {vanna:.6f}")
-                return vanna
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error calculating precise Vanna: {e}")
-            
-            # Ultimate fallback: conservative estimate
-            vega = getattr(greeks, 'vega', None)
+            # Ultimate fallback: conservative estimate from Vega
             delta = getattr(greeks, 'delta', None)
-            
             if vega and delta:
                 abs_delta = abs(delta)
                 scaling = 0.35 if 0.15 <= abs_delta <= 0.35 else 0.20
                 return vega * scaling
             
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error calculating precise Vanna: {e}")
             return None
     
     async def get_bid_ask_spread(self, contract: Contract) -> Optional[float]:
@@ -701,6 +758,75 @@ class IBKRDataFetcher:
             
         except Exception as e:
             logger.error(f"Error getting options with Greeks: {e}")
+    async def get_chain_open_interest(self, symbol: str, expiration: str) -> List[Dict[str, Any]]:
+        """
+        Get Open Interest for all strikes in an expiration
+        
+        Args:
+            symbol: Stock ticker
+            expiration: Expiration date (YYYYMMDD)
+            
+        Returns:
+            List of dicts with strike, call_oi, put_oi
+        """
+        try:
+            ib = self.connection.get_client()
+            
+            # Get contracts for this expiration
+            contracts = await self.get_options_chain(symbol, expiration=expiration)
+            if not contracts:
+                return []
+                
+            logger.info(f"Fetching Open Interest for {len(contracts)} contracts ({expiration})...")
+            
+            # Request market data in batches
+            batch_size = 50
+            results = []
+            
+            # Map strike to OI data
+            # {strike: {'call_oi': 0, 'put_oi': 0}}
+            strike_map = {}
+            
+            for i in range(0, len(contracts), batch_size):
+                batch = contracts[i:i+batch_size]
+                tickers = []
+                
+                for contract in batch:
+                    # Request generic tick 101 (Open Interest)
+                    t = ib.reqMktData(contract, '101', True, False) # Snapshot
+                    tickers.append((contract, t))
+                
+                # Wait for data
+                await ib.sleep(2)
+                
+                for contract, ticker in tickers:
+                    # IBKR maps Option Open Interest to 'futuresOpenInterest' in some versions,
+                    # or accessible via callOpenInterest/putOpenInterest if available.
+                    # For a single option contract, 'callOpenInterest' attribute might not exist on Ticker.
+                    # We check 'futuresOpenInterest' (often used for generic OI) or 'modelGreeks'.
+                    
+                    oi = 0
+                    # Try generic OI field (tick 101 maps to futuresOpenInterest in ib_insync for options too often)
+                    if ticker.futuresOpenInterest:
+                        oi = ticker.futuresOpenInterest
+                    
+                    # If not found, try modelGreeks (sometimes has it?) - No, modelGreeks has IV/Delta etc.
+                    
+                    if contract.strike not in strike_map:
+                        strike_map[contract.strike] = {'strike': contract.strike, 'call_oi': 0, 'put_oi': 0}
+                        
+                    if contract.right == 'C':
+                        strike_map[contract.strike]['call_oi'] = oi
+                    else:
+                        strike_map[contract.strike]['put_oi'] = oi
+                        
+                    # Cancel data
+                    ib.cancelMktData(contract)
+            
+            return list(strike_map.values())
+            
+        except Exception as e:
+            logger.error(f"Error fetching chain OI: {e}")
             return []
 
 

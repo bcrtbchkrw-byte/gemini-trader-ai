@@ -246,7 +246,111 @@ class FeatureEngineering:
             'macd',
         ]
     
+    def extract_exit_features(
+        self,
+        position_data: Dict[str, Any],
+        current_price: float,
+        market_data: Optional[Dict[str, Any]] = None
+    ) -> np.ndarray:
+        """
+        Extract features for exit decision ML model
+        
+        Args:
+            position_data: Dict with position info (entry_credit, entry_date, etc.)
+            current_price: Current spread/position price
+            market_data: Current market conditions
+            
+        Returns:
+            Feature vector for exit strategy model
+        """
+        features = []
+        
+        # === P/L FEATURES ===
+        entry_credit = position_data.get('entry_credit', 1.0)
+        max_risk = position_data.get('max_risk', entry_credit)
+        
+        # Current P/L
+        current_pnl = (entry_credit - current_price) * position_data.get('contracts', 1) * 100
+        pnl_ratio = current_pnl / (max_risk * 100) if max_risk > 0 else 0
+        features.append(pnl_ratio)
+        
+        # === TIME FEATURES ===
+        entry_date = position_data.get('entry_date')
+        expiration = position_data.get('expiration')
+        
+        if isinstance(entry_date, str):
+            from datetime import datetime
+            entry_date = datetime.fromisoformat(entry_date)
+        if isinstance(expiration, str):
+            from datetime import datetime
+            expiration = datetime.fromisoformat(expiration)
+        
+        now = datetime.now()
+        days_in_trade = (now - entry_date).days if entry_date else 0
+        dte = (expiration - now).days if expiration else 30
+        
+        total_duration = (expiration - entry_date).days if (entry_date and expiration) else 45
+        time_ratio = days_in_trade / total_duration if total_duration > 0 else 0.5
+        
+        features.extend([days_in_trade, dte, time_ratio])
+        
+        # === VIX / VOLATILITY FEATURES ===
+        vix_entry = position_data.get('vix_entry', 15.0)
+        vix_current = market_data.get('vix', 15.0) if market_data else 15.0
+        vix_change = vix_current - vix_entry
+        
+        features.extend([vix_current, vix_entry, vix_change])
+        
+        # === GREEKS EVOLUTION ===
+        # Delta drift (how much delta has changed)
+        delta_entry = position_data.get('delta_entry', 0.0)
+        delta_current = market_data.get('delta_current', delta_entry) if market_data else delta_entry
+        delta_drift = abs(delta_current - delta_entry)
+        features.append(delta_drift)
+        
+        # Theta realization (actual vs expected)
+        theta_expected = position_data.get('theta_entry', 0.0)
+        theta_days = days_in_trade if days_in_trade > 0 else 1
+        expected_theta_decay = theta_expected * theta_days
+        
+        actual_pnl_from_theta = current_pnl if expected_theta_decay != 0 else 0
+        theta_realization = actual_pnl_from_theta / abs(expected_theta_decay) if abs(expected_theta_decay) > 0.01 else 1.0
+        theta_realization = np.clip(theta_realization, 0, 3)  # Clamp extremes
+        features.append(theta_realization)
+        
+        # === VOLATILITY TREND ===
+        # Is IV rising or falling?
+        iv_entry = position_data.get('iv_entry', 0.3)
+        iv_current = market_data.get('iv_current', iv_entry) if market_data else iv_entry
+        volatility_trend = iv_current - iv_entry
+        features.append(volatility_trend)
+        
+        # === MARKET REGIME ===
+        # Use RegimeClassifier if available
+        regime_score = 2.0  # Default: NEUTRAL
+        
+        if market_data and 'regime' in market_data:
+            regime_map = {
+                'BULL_TRENDING': 0,
+                'BEAR_TRENDING': 1,
+                'HIGH_VOL_NEUTRAL': 2,
+                'LOW_VOL_NEUTRAL': 3,
+                'EXTREME_STRESS': 4
+            }
+            regime_score = regime_map.get(market_data['regime'], 2)
+        
+        features.append(regime_score)
+        
+        # === PROFIT VELOCITY ===
+        # Rate of P/L change (useful for trailing decisions)
+        highest_profit = position_data.get('highest_profit_seen', current_pnl)
+        profit_velocity = (current_pnl - (highest_profit * 0.9)) / days_in_trade if days_in_trade > 0 else 0
+        features.append(profit_velocity)
+        
+        return np.array(features, dtype=np.float32)
+    
     def get_feature_count(self) -> int:
+
         """Get total number of features"""
         return len(self.feature_names)
 
