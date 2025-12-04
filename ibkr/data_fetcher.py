@@ -800,6 +800,162 @@ class IBKRDataFetcher:
                 await ib.sleep(2)
                 
                 for contract, ticker in tickers:
+                    call_oi = 0
+                    put_oi = 0
+                    
+                    if contract.right == 'C':
+                        call_oi = ticker.futuresOpenInterest if ticker.futuresOpenInterest > 0 else 0
+                    else:
+                        put_oi = ticker.futuresOpenInterest if ticker.futuresOpenInterest > 0 else 0
+                        
+                    strike = contract.strike
+                    if strike not in strike_map:
+                        strike_map[strike] = {'strike': strike, 'call_oi': 0, 'put_oi': 0}
+                        
+                    if contract.right == 'C':
+                        strike_map[strike]['call_oi'] = call_oi
+                    else:
+                        strike_map[strike]['put_oi'] = put_oi
+                        
+                    # Cancel subscription
+                    ib.cancelMktData(contract)
+                    
+                results = list(strike_map.values())
+                
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error fetching Open Interest: {e}")
+            return []
+
+    async def get_technical_indicators(self, symbol: str) -> Dict[str, Any]:
+        """
+        Get technical indicators (RSI, SMA200) for a symbol
+        
+        Args:
+            symbol: Stock ticker
+            
+        Returns:
+            Dict with RSI, SMA200, and Distance to SMA200
+        """
+        try:
+            import pandas as pd
+            import numpy as np
+            
+            ib = self.connection.get_client()
+            stock = Stock(symbol, 'SMART', 'USD')
+            await ib.qualifyContractsAsync(stock)
+            
+            # Request 1 year of daily data
+            bars = await ib.reqHistoricalDataAsync(
+                stock,
+                endDateTime='',
+                durationStr='1 Y',
+                barSizeSetting='1 day',
+                whatToShow='TRADES',
+                useRTH=True
+            )
+            
+            if not bars:
+                logger.warning(f"No historical data for {symbol}")
+                return {'rsi': 50, 'sma200': 0, 'distance_to_sma200': 0}
+                
+            # Convert to DataFrame
+            df = pd.DataFrame(bars)
+            df['close'] = df['close'].astype(float)
+            
+            # Calculate SMA 200
+            df['sma200'] = df['close'].rolling(window=200).mean()
+            
+            # Calculate RSI 14
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            
+            rs = gain / loss
+            df['rsi'] = 100 - (100 / (1 + rs))
+            
+            # Get latest values
+            latest = df.iloc[-1]
+            current_price = latest['close']
+            sma200 = latest['sma200'] if not np.isnan(latest['sma200']) else current_price
+            rsi = latest['rsi'] if not np.isnan(latest['rsi']) else 50
+            
+            # Calculate distance to SMA200 (%)
+            # Positive = Above SMA (Uptrend), Negative = Below SMA (Downtrend)
+            distance = ((current_price - sma200) / sma200) * 100 if sma200 > 0 else 0
+            
+            logger.info(f"{symbol} Technicals: RSI={rsi:.1f}, SMA200=${sma200:.2f}, Dist={distance:.1f}%")
+            
+            return {
+                'rsi': rsi,
+                'sma200': sma200,
+                'distance_to_sma200': distance
+            }
+            
+        except Exception as e:
+            logger.error(f"Error calculating technicals for {symbol}: {e}")
+            return {'rsi': 50, 'sma200': 0, 'distance_to_sma200': 0}
+
+    async def get_vix_term_structure(self) -> Dict[str, Any]:
+        """
+        Get VIX Term Structure (VIX vs VIX3M)
+        
+        Returns:
+            Dict with vix, vix3m, ratio, structure (CONTANGO/BACKWARDATION)
+        """
+        try:
+            ib = self.connection.get_client()
+            
+            # Get VIX
+            vix_val = await self.get_vix()
+            if not vix_val:
+                return {'vix': 0, 'vix3m': 0, 'ratio': 1.0, 'structure': 'UNKNOWN'}
+                
+            # Get VIX3M (CBOE 3-Month Volatility Index)
+            # Note: Ticker might vary, assuming 'VIX3M' works or we fallback
+            vix3m = Index('VIX3M', 'CBOE')
+            
+            # Try to get data
+            try:
+                ticker = ib.reqMktData(vix3m, '', False, False)
+                await ib.sleep(2)
+                
+                if ticker.last > 0:
+                    vix3m_val = ticker.last
+                elif ticker.close > 0:
+                    vix3m_val = ticker.close
+                else:
+                    # Fallback if VIX3M not available: Estimate or use VIX
+                    # For now, let's assume 1.1 * VIX as a dummy if missing (to avoid crash)
+                    # But better to return None
+                    vix3m_val = vix_val # Neutral fallback
+                    
+                ib.cancelMktData(vix3m)
+                
+            except Exception:
+                vix3m_val = vix_val
+                
+            ratio = vix_val / vix3m_val if vix3m_val > 0 else 1.0
+            
+            # Contango: VIX < VIX3M (Ratio < 1) -> Normal market
+            # Backwardation: VIX > VIX3M (Ratio > 1) -> Fear/Panic
+            structure = "BACKWARDATION" if ratio > 1.0 else "CONTANGO"
+            
+            logger.info(f"VIX Term Structure: VIX={vix_val:.2f}, VIX3M={vix3m_val:.2f}, Ratio={ratio:.2f} ({structure})")
+            
+            return {
+                'vix': vix_val,
+                'vix3m': vix3m_val,
+                'ratio': ratio,
+                'structure': structure
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting VIX term structure: {e}")
+            return {'vix': 0, 'vix3m': 0, 'ratio': 1.0, 'structure': 'UNKNOWN'}
+                
+                for contract, ticker in tickers:
                     # IBKR maps Option Open Interest to 'futuresOpenInterest' in some versions,
                     # or accessible via callOpenInterest/putOpenInterest if available.
                     # For a single option contract, 'callOpenInterest' attribute might not exist on Ticker.

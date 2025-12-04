@@ -126,6 +126,43 @@ class Database:
                 )
             """)
             
+            # Shadow Trades table (Rejected trades for analysis)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS shadow_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    symbol TEXT NOT NULL,
+                    strategy TEXT NOT NULL,
+                    rejection_reason TEXT,
+                    confidence_score REAL,
+                    
+                    -- Trade details we WOULD have executed
+                    option_type TEXT,
+                    short_strike REAL,
+                    long_strike REAL,
+                    expiration TEXT,
+                    credit_received REAL,
+                    
+                    -- ML Features
+                    vix REAL,
+                    delta REAL,
+                    gamma REAL,
+                    theta REAL,
+                    vega REAL,
+                    iv_rank REAL,
+                    
+                    -- Tracking
+                    status TEXT DEFAULT 'TRACKING', -- TRACKING, EVALUATED
+                    outcome TEXT, -- GOOD_REJECT, MISSED_OPPORTUNITY, NEUTRAL
+                    
+                    -- Evaluation results
+                    final_pnl REAL,
+                    max_drawdown REAL,
+                    evaluation_date DATETIME,
+                    notes TEXT
+                )
+            """)
+            
             await db.commit()
             logger.info("Database initialized successfully")
     
@@ -308,6 +345,74 @@ class Database:
             async with db.execute(query, params) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
+
+    async def log_shadow_trade(self, trade_data: Dict[str, Any]) -> int:
+        """
+        Log a rejected trade for shadow tracking
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                INSERT INTO shadow_trades (
+                    symbol, strategy, rejection_reason, confidence_score,
+                    option_type, short_strike, long_strike, expiration,
+                    credit_received, 
+                    vix, delta, gamma, theta, vega, iv_rank,
+                    notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                trade_data.get('symbol'),
+                trade_data.get('strategy'),
+                trade_data.get('rejection_reason'),
+                trade_data.get('confidence_score'),
+                trade_data.get('option_type'),
+                trade_data.get('short_strike'),
+                trade_data.get('long_strike'),
+                trade_data.get('expiration'),
+                trade_data.get('credit_received'),
+                trade_data.get('vix'),
+                trade_data.get('delta'),
+                trade_data.get('gamma'),
+                trade_data.get('theta'),
+                trade_data.get('vega'),
+                trade_data.get('iv_rank'),
+                trade_data.get('notes')
+            ))
+            
+            await db.commit()
+            trade_id = cursor.lastrowid
+            logger.info(f"Shadow trade logged with ID: {trade_id}")
+            return trade_id
+
+    async def get_pending_shadow_trades(self) -> List[Dict[str, Any]]:
+        """Get shadow trades that need tracking"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("""
+                SELECT * FROM shadow_trades 
+                WHERE status = 'TRACKING'
+            """) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def update_shadow_outcome(
+        self, 
+        trade_id: int, 
+        outcome: str, 
+        final_pnl: float,
+        notes: str = None
+    ):
+        """Update the final outcome of a shadow trade"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                UPDATE shadow_trades
+                SET status = 'EVALUATED',
+                    outcome = ?,
+                    final_pnl = ?,
+                    evaluation_date = CURRENT_TIMESTAMP,
+                    notes = ?
+                WHERE id = ?
+            """, (outcome, final_pnl, notes, trade_id))
+            await db.commit()
 
 
 # Singleton instance

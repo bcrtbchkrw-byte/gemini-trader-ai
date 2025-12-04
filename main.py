@@ -364,6 +364,41 @@ class GeminiTraderAI:
                     decision = claude_result.get('decision', 'REJECT')
                     approved = claude_result.get('approved', False)
                     
+                    # 🤖 ML DYNAMIC THRESHOLD: Check if we should override rejection
+                    # If confidence is 8.0+ (normally rejected) but ML says it's a "Missed Opportunity"
+                    if not approved and confidence >= 8.0:
+                        try:
+                            from ml.rejection_model import get_rejection_model
+                            rejection_model = get_rejection_model()
+                            
+                            # Prepare data for prediction
+                            pred_data = {
+                                'confidence_score': confidence,
+                                'vix': vix,
+                                'greeks': greeks_data,
+                                'iv_rank': stock_data.get('iv_rank', 50)
+                            }
+                            
+                            ml_prob = rejection_model.predict(pred_data)
+                            
+                            # If ML is >80% sure this is a mistake, allow it
+                            if ml_prob > 0.80:
+                                logger.info(
+                                    f"   🚀 ML OVERRIDE: Confidence {confidence}/10 accepted! "
+                                    f"ML predicts Missed Opportunity (Prob: {ml_prob:.1%})"
+                                )
+                                approved = True
+                                decision = 'APPROVED (ML OVERRIDE)'
+                                claude_result['decision'] = decision
+                                claude_result['approved'] = True
+                                claude_result['reasoning'] += f" [ML Override: Prob {ml_prob:.1%}]"
+                            else:
+                                logger.info(
+                                    f"   ML agrees with rejection (Prob of mistake: {ml_prob:.1%})"
+                                )
+                        except Exception as ml_err:
+                            logger.error(f"   ML Override check failed: {ml_err}")
+
                     # 🛡️ SANITY CHECK: Validate against real market data
                     if approved:
                         from validation.ai_sanity_checker import get_sanity_checker
@@ -439,20 +474,20 @@ class GeminiTraderAI:
                     
                     logger.info(f"   ✅ {len(safe_strikes)} safe strike(s) identified via ML")
                         
-                        validation = sanity_checker.validate_recommendation(
-                            recommendation=rec_to_validate,
-                            options_data=options_data,
-                            current_price=stock_data['price']
-                        )
+                    validation = sanity_checker.validate_recommendation(
+                        recommendation=rec_to_validate,
+                        options_data=options_data,
+                        current_price=stock_data['price']
+                    )
                         
-                        if not validation['valid']:
-                            logger.error(
-                                f"❌ AI SANITY CHECK FAILED for {symbol}:\n"
-                                + "\n".join(f"      {err}" for err in validation['errors'])
-                            )
-                            approved = False  # Override approval
-                            decision = 'REJECT'
-                            confidence = 0
+                    if not validation['valid']:
+                        logger.error(
+                            f"❌ AI SANITY CHECK FAILED for {symbol}:\n"
+                            + "\n".join(f"      {err}" for err in validation['errors'])
+                        )
+                        approved = False  # Override approval
+                        decision = 'REJECT'
+                        confidence = 0
                     
                     # Log result with confidence
                     confidence_emoji = "🔥" if confidence >= 9 else "⚠️" if confidence >= 7 else "❌"
@@ -472,6 +507,50 @@ class GeminiTraderAI:
                     else:
                         reason = claude_result.get('reasoning', 'Low confidence')
                         logger.info(f"   ❌ REJECTED - {reason}\n")
+                        
+                        # SHADOW TRADING: Log rejected trade for future analysis
+                        try:
+                            # Get ML Second Opinion
+                            from ml.rejection_model import get_rejection_model
+                            rejection_model = get_rejection_model()
+                            
+                            # Prepare data for prediction
+                            pred_data = {
+                                'confidence_score': confidence,
+                                'vix': vix,
+                                'greeks': greeks_data,
+                                'iv_rank': stock_data['iv_rank']
+                            }
+                            
+                            ml_prob = rejection_model.predict(pred_data)
+                            ml_verdict = "⚠️ POTENTIAL MISTAKE" if ml_prob > 0.7 else "✅ CONFIRMED REJECT"
+                            
+                            logger.info(f"   🤖 ML Second Opinion: {ml_verdict} (Prob of Mistake: {ml_prob:.1%})")
+                            
+                            shadow_trade = {
+                                'symbol': symbol,
+                                'strategy': 'CREDIT_SPREAD',
+                                'rejection_reason': reason,
+                                'confidence_score': confidence,
+                                'option_type': 'CALL', # TODO: Detect dynamically
+                                'short_strike': options_data[0].get('strike'),
+                                'long_strike': options_data[0].get('strike') + 5, # Assumption
+                                'expiration': options_data[0].get('expiration'),
+                                'credit_received': 0.50, # Placeholder or estimate
+                                
+                                # ML Features
+                                'vix': vix,
+                                'delta': greeks_data.get('delta'),
+                                'gamma': greeks_data.get('gamma'),
+                                'theta': greeks_data.get('theta'),
+                                'vega': greeks_data.get('vega'),
+                                'iv_rank': stock_data.get('iv_rank'),
+                                
+                                'notes': f"Rejected by Gatekeeper. ML Opinion: {ml_verdict} ({ml_prob:.1%})"
+                            }
+                            await self.db.log_shadow_trade(shadow_trade)
+                        except Exception as st_error:
+                            logger.error(f"Failed to log shadow trade: {st_error}")
                         
                 except Exception as e:
                     logger.error(f"   ❌ Error analyzing {symbol}: {e}\n")

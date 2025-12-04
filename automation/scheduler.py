@@ -11,58 +11,42 @@ import os
 
 from analysis.stock_screener_ibkr import get_stock_screener  # IBKR native scanner
 from ai.gemini_client import get_gemini_client
+from analysis.shadow_tracker import get_shadow_tracker
 
 
 class TradingScheduler:
     """Schedule trading activities to minimize AI token usage"""
     
     def __init__(self):
-        self.premarket_scanner = get_premarket_scanner()
+        # self.premarket_scanner = get_premarket_scanner() # Missing file
         self.screener = get_stock_screener()
         self.gemini = get_gemini_client()
+        self.shadow_tracker = get_shadow_tracker()
         self.running = False
     
     async def run_scheduled_scan(self):
         """
-        Run scheduled premarket scan + analysis
-        
-        Workflow:
-        1. 8:45 AM: Premarket scan (find movers)
-        2. 9:00 AM: Run Phase 1-2 on cached candidates
-        3. Cache results for rest of day
+        Run scheduled scan + analysis
         """
         logger.info("=" * 60)
         logger.info("🕐 SCHEDULED SCAN STARTED")
         logger.info("=" * 60)
         
         try:
-            # Step 1: Premarket scan (if time is right)
-            if self.premarket_scanner.should_run_scan():
-                logger.info("\n📊 Running premarket scan...")
-                candidates = await self.premarket_scanner.scan_premarket(max_candidates=15)
-                
-                if not candidates:
-                    logger.warning("No premarket candidates found")
-                    return
-                
-                logger.info(f"\n✅ Found {len(candidates)} premarket movers:")
-                for i, c in enumerate(candidates[:5], 1):
-                    logger.info(
-                        f"  {i}. {c['symbol']}: Gap {c['gap_pct']:+.1f}%, "
-                        f"Volume {c['volume_ratio']:.1f}x, Score: {c['score']}"
-                    )
-            
-            # Step 2: Get cached candidates
-            candidates = self.premarket_scanner.get_cached_candidates()
+            # Step 1: Scan for candidates
+            logger.info("\n📊 Running market scan...")
+            candidates = await self.screener.screen(max_candidates=15)
             
             if not candidates:
-                logger.warning("No cached candidates - run premarket scan first")
+                logger.warning("No candidates found")
                 return
             
-            # Step 3: Run Phase 1-2 on top picks (no IBKR yet = no cost)
-            logger.info("\n🤖 Running AI analysis on top picks...")
+            logger.info(f"\n✅ Found {len(candidates)} candidates:")
+            for i, c in enumerate(candidates[:5], 1):
+                logger.info(f"  {i}. {c['symbol']}: IV Rank {c.get('iv_rank', 0)}, Score: {c.get('score', 0)}")
             
-            top_symbols = [c['symbol'] for c in candidates[:10]]
+            # Step 2: Run Phase 1-2 on top picks
+            logger.info("\n🤖 Running AI analysis on top picks...")
             
             # Use existing screening pipeline
             from analysis.news_fetcher import get_news_fetcher
@@ -74,6 +58,8 @@ class TradingScheduler:
             await vix_monitor.update()
             vix = vix_monitor.get_current_vix()
             
+            top_symbols = [c['symbol'] for c in candidates[:10]]
+            
             # Fetch news
             news_context = await news_fetcher.fetch_batch(top_symbols)
             
@@ -81,9 +67,9 @@ class TradingScheduler:
             candidate_data = [
                 {
                     'symbol': c['symbol'],
-                    'price': c['current_price'],
-                    'iv_rank': 50,  # Would use real IV calculator here
-                    'sector': c['sector']
+                    'price': c.get('price', 0),
+                    'iv_rank': c.get('iv_rank', 50),
+                    'sector': c.get('sector', 'Unknown')
                 }
                 for c in candidates[:10]
             ]
@@ -171,47 +157,105 @@ class TradingScheduler:
         # It can be populated if a dedicated premarket scan trigger is needed.
         pass
 
-    async def run_scheduler_loop(self):
+    def _get_scan_interval(self, current_time: time) -> int:
         """
-        Main scheduler loop
+        Get scan interval in minutes based on market hours
         
         Schedule:
-        - 8:45 AM: Premarket scan
-        - 9:00 AM: Full analysis (Phase 1-2)
-        - Then check cache every hour for Phase 3 opportunities
+        - 09:30 - 10:30: Every 15 min (High Opportunity)
+        - 10:30 - 11:00: Every 30 min (Transition)
+        - 11:00 - 14:30: Every 60 min (Lunch Lull)
+        - 14:30 - 16:00: Every 30 min (Closing Prep)
+        - Other: 60 min
         """
-        logger.info("🕐 Scheduler started")
+        # Convert to minutes for easier comparison
+        current_min = current_time.hour * 60 + current_time.minute
+        
+        t_930 = 9 * 60 + 30
+        t_1030 = 10 * 60 + 30
+        t_1100 = 11 * 60
+        t_1430 = 14 * 60 + 30
+        t_1600 = 16 * 60
+        
+        if t_930 <= current_min < t_1030:
+            return 15
+        elif t_1030 <= current_min < t_1100:
+            return 30
+        elif t_1100 <= current_min < t_1430:
+            return 60
+        elif t_1430 <= current_min < t_1600:
+            return 30
+        else:
+            return 60
+
+    async def run_scheduler_loop(self):
+        """
+        Main scheduler loop with dynamic intervals (US/Eastern Time)
+        """
+        from utils.market_time import MarketTime, initialize_market_time
+        
+        # Sync time on startup
+        await initialize_market_time()
+        
+        logger.info("🕐 Scheduler started with DYNAMIC INTERVALS (US/Eastern Time)")
         self.running = True
         
+        # Times are now timezone-aware (US/Eastern)
+        # We use time objects, but comparisons will be done against MarketTime.get_now().time()
         scheduled_times = {
             'premarket_scan': time(8, 45),
-            'full_analysis': time(9, 0),
+            'shadow_eval': time(16, 15), # After market close
         }
         
-        last_run = {}
+        last_run = {
+            'scan': datetime.min.replace(tzinfo=pytz.timezone('US/Eastern')),
+            'premarket': datetime.min.replace(tzinfo=pytz.timezone('US/Eastern')),
+            'shadow': datetime.min.replace(tzinfo=pytz.timezone('US/Eastern'))
+        }
         
         while self.running:
             try:
-                now = datetime.now()
+                # Get current MARKET time (US/Eastern)
+                now = MarketTime.get_now()
                 current_time = now.time()
                 
-                # Check premarket scan
+                # 1. Fixed Time Tasks
+                # Premarket Scan (8:45)
                 if (current_time >= scheduled_times['premarket_scan'] and
-                    last_run.get('premarket_scan', datetime.min).date() != now.date()):
+                    last_run['premarket'].date() != now.date()):
                     
                     logger.info("\n🔔 Premarket scan time!")
                     await self.run_scheduled_scan()
-                    last_run['premarket_scan'] = now
+                    last_run['premarket'] = now
                 
-                # Sleep for 5 minutes
-                await asyncio.sleep(300)
+                # Shadow Trade Evaluation (16:15)
+                if (current_time >= scheduled_times['shadow_eval'] and
+                    last_run['shadow'].date() != now.date()):
+                    
+                    logger.info("\n🔔 Shadow trade evaluation time!")
+                    await self.shadow_tracker.run_daily_evaluation()
+                    last_run['shadow'] = now
+                
+                # 2. Dynamic Interval Tasks (Market Hours Scan)
+                # Only run between 9:30 and 16:00
+                market_open = time(9, 30)
+                market_close = time(16, 0)
+                
+                if market_open <= current_time <= market_close:
+                    interval_minutes = self._get_scan_interval(current_time)
+                    time_since_last = (now - last_run['scan']).total_seconds() / 60
+                    
+                    if time_since_last >= interval_minutes:
+                        logger.info(f"\n🔔 Scheduled Scan (Interval: {interval_minutes}m)")
+                        await self.run_scheduled_scan()
+                        last_run['scan'] = now
+                
+                # Sleep for 1 minute to check again
+                await asyncio.sleep(60)
                 
             except Exception as e:
                 logger.error(f"Scheduler loop error: {e}")
                 await asyncio.sleep(60)
-            except Exception as e:
-                logger.error(f"Error in scheduled scan: {e}")
-                await asyncio.sleep(300)  # Wait 5 min before retry
     
     async def cleanup_stale_orders_loop(self):
         """
