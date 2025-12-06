@@ -210,8 +210,17 @@ class FeatureEngineering:
                 features.append(macd.iloc[-1] / prices.iloc[-1] if prices.iloc[-1] > 0 else 0)
             else:
                 features.append(0.0)
+
+            # SMA 200 Distance
+            if len(prices) >= 200:
+                sma_200 = prices.rolling(window=200).mean().iloc[-1]
+                distance = (prices.iloc[-1] - sma_200) / sma_200 if sma_200 > 0 else 0
+                features.append(distance)
+            else:
+                features.append(0.0)
+            
         else:
-            features.extend([50.0, 0.0])  # Defaults
+            features.extend([50.0, 0.0, 0.0])  # Defaults incl SMA
             
         return features
     
@@ -243,7 +252,9 @@ class FeatureEngineering:
             
             # Technical (2 features)
             'rsi',
+            'rsi',
             'macd',
+            'distance_to_sma200',
         ]
     
     def extract_exit_features(
@@ -288,6 +299,40 @@ class FeatureEngineering:
         now = datetime.now()
         days_in_trade = (now - entry_date).days if entry_date else 0
         dte = (expiration - now).days if expiration else 30
+        
+        # === WHALE FLOW SENTIMENT ===
+        # Score from -1.0 (Bearish) to 1.0 (Bullish) based on unusual options volume
+        whale_score = market_data.get('whale_sentiment_score', 0.0) if market_data else 0.0
+        features.append(whale_score)
+
+        # === EARNINGS PROXIMITY (CRITICAL FOR VOLATILITY) ===
+        earnings_date_str = market_data.get('next_earnings_date') if market_data else None
+        days_until_earnings = 999
+        earnings_score = 0.0
+        
+        if earnings_date_str:
+            try:
+                # Handle ISO format or datetime object
+                if isinstance(earnings_date_str, str):
+                    earnings_date = datetime.fromisoformat(earnings_date_str)
+                else:
+                    earnings_date = earnings_date_str
+                    
+                days_until_earnings = (earnings_date - now).days
+                
+                # Calculate Risk Score (Exponential decay as event approaches)
+                # 0 days = 1.0 (Max Risk/Opportunity)
+                # 30 days = ~0.0
+                if days_until_earnings >= 0:
+                     earnings_score = np.exp(-0.15 * days_until_earnings)
+                else:
+                    # Earnings just passed - usually volatility crush phase (safe)
+                    earnings_score = -1.0 
+                    
+            except Exception as e:
+                pass # safely ignore parsing errors
+                
+        features.append(earnings_score) # New Feature
         
         total_duration = (expiration - entry_date).days if (entry_date and expiration) else 45
         time_ratio = days_in_trade / total_duration if total_duration > 0 else 0.5

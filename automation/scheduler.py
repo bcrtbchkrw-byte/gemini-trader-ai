@@ -249,6 +249,27 @@ class TradingScheduler:
                         logger.info(f"\n🔔 Scheduled Scan (Interval: {interval_minutes}m)")
                         await self.run_scheduled_scan()
                         last_run['scan'] = now
+
+                    # NEW: ML Exit Strategy Monitoring (Runs every minute)
+                    try:
+                        from execution.exit_manager import get_exit_manager
+                        exit_manager = get_exit_manager()
+                        
+                        logger.debug("Running ML exit monitoring...")
+                        exit_signals = await exit_manager.monitor_exits()
+                        
+                        if exit_signals:
+                            # Process exits (if auto-execute is enabled)
+                            # For now, just log heavily, as actual execution needs testing
+                            for signal in exit_signals:
+                                logger.warning(
+                                    f"🚨 EXIT SIGNAL DETECTED: {signal['position'].symbol} "
+                                    f"Reason: {signal['reason']}"
+                                )
+                                # In production: await exit_manager.place_closing_order(signal['position'], signal['reason'])
+                                
+                    except Exception as ex_error:
+                        logger.error(f"Error in exit monitoring: {ex_error}")
                 
                 # Sleep for 1 minute to check again
                 await asyncio.sleep(60)

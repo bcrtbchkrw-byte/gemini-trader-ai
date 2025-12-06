@@ -483,7 +483,98 @@ class OrderManager:
         except Exception as e:
             logger.error(f"Error cancelling stale orders: {e}")
             return 0
+            logger.error(f"Error cancelling stale orders: {e}")
+            return 0
+            
+    async def place_roll_combo_order(
+        self,
+        symbol: str,
+        close_legs: List[Dict[str, Any]],
+        open_legs: List[Dict[str, Any]],
+        net_price: float,
+        is_credit: bool,
+        exchange: str = "SMART"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Place atomic COMBO order to roll a position.
+        Closes 'close_legs' and opens 'open_legs' in a single transaction.
+        
+        Args:
+            symbol: Underlying symbol
+            close_legs: List of dicts {'conId': int, 'action': 'BUY'/'SELL', 'ratio': int}
+            open_legs: List of dicts with same structure
+            net_price: Limit price for the whole combo
+            is_credit: True if receiving credit (Net Sell), False if debit (Net Buy)
+        """
+        try:
+            ib = self._get_client()
+            
+            # Create BAG contract
+            contract = Contract()
+            contract.symbol = symbol
+            contract.secType = "BAG"
+            contract.currency = "USD"
+            contract.exchange = exchange
+            
+            from ib_insync import ComboLeg
+            
+            combo_legs = []
+            
+            # Add Closing Legs (Reverse action of open position)
+            # E.g. if we are Short Call (SELL), we BUG to close.
+            # The 'action' in close_legs arg should specify the ACTION TO TAKE (e.g. BUY to close short)
+            for leg in close_legs:
+                combo_legs.append(ComboLeg(
+                    conId=leg['conId'],
+                    ratio=leg['ratio'],
+                    action=leg['action'],
+                    exchange=exchange
+                ))
+                
+            # Add Opening Legs
+            for leg in open_legs:
+                combo_legs.append(ComboLeg(
+                    conId=leg['conId'],
+                    ratio=leg['ratio'],
+                    action=leg['action'],
+                    exchange=exchange
+                ))
+                
+            contract.comboLegs = combo_legs
+            
+            # Place Order
+            # For Combo: BUY = Debit, SELL = Credit usually.
+            # But it depends on the net effect.
+            # If is_credit=True, we generally SELL the combo.
+            action = "SELL" if is_credit else "BUY"
+            
+            order = LimitOrder(
+                action=action,
+                totalQuantity=1, # Usually rolling 1 structure at a time or loop
+                lmtPrice=net_price,
+                tif="GTC"
+            )
+            
+            trade = ib.placeOrder(contract, order)
+            self._active_orders[trade.order.orderId] = trade
+            self._order_timestamps[trade.order.orderId] = datetime.now()
+            
+            logger.info(
+                f"ROLL ORDER PLACED - ID: {trade.order.orderId}\n"
+                f"  Symbol: {symbol}\n"
+                f"  Legs: {len(combo_legs)} (Close {len(close_legs)} / Open {len(open_legs)})\n"
+                f"  Net: {'CREDIT' if is_credit else 'DEBIT'} ${net_price:.2f}"
+            )
+            
+            return {
+                'order_id': trade.order.orderId,
+                'status': 'Submitted',
+                'trade': trade
+            }
 
+        except Exception as e:
+            logger.error(f"Error placing roll order: {e}")
+            return None
 
 # Singleton instance
 _order_manager: Optional[OrderManager] = None

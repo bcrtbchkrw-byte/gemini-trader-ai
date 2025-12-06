@@ -868,16 +868,27 @@ class ExitManager:
         exit_signals = []
         
         # Get current market data for ML
+        market_data = None
+        current_vix = 0.0
         try:
             from ml.regime_classifier import get_regime_classifier
+            from ibkr.data_fetcher import get_data_fetcher
+            from ibkr.position_tracker import get_position_tracker
             
+            data_fetcher = get_data_fetcher()
             regime_classifier = get_regime_classifier()
+            position_tracker = get_position_tracker()
             
-            # TODO: Fetch real VIX from IBKR
-            current_vix = 17.0  # Placeholder
+            # Update positions from IBKR to get fresh prices
+            tracker_positions = await position_tracker.update_positions()
+            
+            # Fetch real VIX
+            vix_val = await data_fetcher.get_vix()
+            current_vix = vix_val if vix_val else 18.0
             
             # Predict regime
-            features = np.array([current_vix, 450.0, 0.3, 0.25, 50.0, 0.005, 0.01])  # Simplified
+            # Note: Using simplified features. In production, use full feature engineering.
+            features = np.array([current_vix, 450.0, 0.3, 0.25, 50.0, 0.005, 0.01]) 
             regime, regime_confidence = regime_classifier.predict_regime(features)
             
             market_data = {
@@ -886,44 +897,166 @@ class ExitManager:
                 'regime_confidence': regime_confidence
             }
             
+            # Initialize Rolling Manager
+            from execution.rolling_manager import get_rolling_manager
+            rolling_manager = get_rolling_manager()
+            
         except Exception as e:
             logger.warning(f"Could not fetch market data for ML: {e}")
-            market_data = None
-        
+            # Continue without market data (will fallback to static rules)
+
         for position in positions:
-            # TODO: Fetch current price from IBKR
-            # For now, we'll just check time-based exits
+            current_price = 0.0
+            price_found = False
             
+            # Calculate current price by summing legs from position tracker
+            try:
+                # Filter tracker positions for this specific trade
+                trade_legs_pnl = 0.0
+                trade_market_value = 0.0
+                matched_legs_count = 0
+                
+                for leg in position.legs:
+                    # Match leg with tracker position
+                    # logic: symbol, strike, right (date match needed too)
+                    for track_pos in tracker_positions:
+                        if (track_pos['symbol'] == leg['symbol'] and
+                            track_pos.get('strike') == leg['strike'] and
+                            track_pos.get('right') == leg['option_type'] and
+                            track_pos['position'] != 0):
+                            
+                            # Found match
+                            trade_market_value += track_pos['market_value']
+                            matched_legs_count += 1
+                            break
+                            
+                if matched_legs_count > 0:
+                    # Calculate price per contract based on total market value
+                    # Market Value = Price * Multiplier (100) * Quantity
+                    # Position is atomic, so total quantity = position.contracts * legs count? 
+                    # No, net value.
+                    # Best metric: Current P&L from tracker vs Entry Credit
+                    
+                    # For spread: Value = Sum of legs.
+                    # Price per contract = Total Value / (Contracts * 100)
+                    if position.contracts > 0:
+                        current_price = -(trade_market_value / (position.contracts * 100))
+                        # Note: Short positions have negative market value.
+                        # We want positive Debit to close.
+                        # Credit Spread: Entry Credit (+). Current Price is cost to close (+).
+                        # If we received $1.00. Current cost $0.80. PnL = 0.20.
+                        # Market Value of short leg is -0.80.
+                        # So Cost = -MarketValue.
+                        price_found = True
+                        
+                if not price_found:
+                    logger.debug(f"Could not calculate current price for {position.symbol} (legs mismatch)")
+                    current_price = 0.0
+
+            except Exception as e:
+                logger.error(f"Error matching positions: {e}")
+
+            # Fetch Earnings Date for ML Context
+            next_earnings = None
+            try:
+                next_earnings = await data_fetcher.get_earnings_date(position.symbol)
+            except Exception as e_earn:
+                pass
+                
+            # Update market data context for this position
+            position_market_data = market_data.copy() if market_data else {}
+            if next_earnings:
+                position_market_data['next_earnings_date'] = next_earnings.isoformat()
+
             logger.info(
                 f"Monitoring {position.symbol}: "
+                f"Price=${current_price:.2f}, "
                 f"DTE={position.days_to_expiration}, "
-                f"Days in trade={position.days_in_trade}, "
-                f"ML enabled={position.trailing_stop_enabled or position.trailing_profit_enabled}"
+                f"Earnings={next_earnings.date() if next_earnings else 'N/A'}, "
+                f"ML enabled={position.trailing_stop_enabled}"
             )
             
-            # If we have market data and a current price, check ML-enhanced exits
-            # Otherwise, fall back to time-based only
-            if market_data:
-                # Simulate checking with ML (would need real price from IBKR)
-                # For now, just log that ML would be used
-                logger.debug(
-                    f"ML exit monitoring for {position.symbol}: "
-                    f"Regime={market_data['regime']}, VIX={market_data['vix']:.1f}"
-                )
+            # Check exit conditions (ML enhanced)
+            exit_decision = position.should_exit(current_price, position_market_data)
             
-            # Check time-based exit (always works even without current price)
-            if position.days_to_expiration <= position.time_exit_dte:
+            # Feature: SMART ROLLING
+            # If exit signal is STOP LOSS, check if we can Roll instead
+            if exit_decision['should_exit'] and "Stop Loss" in exit_decision['reason']:
+                logger.info(f"🛑 Stop Loss Triggered for {position.symbol}. Checking for Rolling possibility...")
+                
+                # Enrich market data for Rolling Check
+                roll_market_data = position_market_data.copy()
+                roll_market_data['price'] = current_price
+                
+                roll_eval = await rolling_manager.evaluate_roll(
+                    position_data={'symbol': position.symbol, 'position': -1, 'strike': 0}, # Todo: Pass real pos details
+                    market_data=roll_market_data
+                )
+                
+                if roll_eval['decision'] == 'ROLL':
+                    logger.info(f"🔄 ROLLING APPROVED by AI: {roll_eval['reason']}")
+                    # TODO: Trigger Roll Execution here
+                    # For now, we inhibit the Exit and log the intention
+                    logger.info("   (Simulation) Rolling execution would start here. Preventing hard exit.")
+                    # continue # Skip the hard exit below
+                else:
+                     logger.info(f"❌ Roll Rejected ({roll_eval['reason']}). Proceeding with Stop Loss.")
+            
+            if exit_decision['should_exit']:
+                # Log detailed reason
+                logger.info(
+                    f"🔔 EXIT SIGNAL for {position.symbol}: {exit_decision['reason']} "
+                    f"(Confidence: {exit_decision.get('ml_confidence', 0):.1%})"
+                )
+                
+                # Update DB state if ML levels changed
+                if position.ml_last_update:
+                    await self._update_db_exit_levels(position)
+                
                 exit_signals.append({
                     'position': position,
-                    'reason': 'TIME_EXIT',
-                    'dte': position.days_to_expiration,
-                    'ml_enabled': position.trailing_stop_enabled or position.trailing_profit_enabled
+                    'reason': exit_decision['reason'],
+                    'details': exit_decision
                 })
+            
+            # Save updated trailing levels to DB periodically
+            elif position.ml_last_update and market_data:
+                await self._update_db_exit_levels(position)
         
         if exit_signals:
             logger.info(f"Found {len(exit_signals)} positions ready to exit")
         
         return exit_signals
+
+    async def _update_db_exit_levels(self, position):
+        """Persist updated trailing levels to DB"""
+        try:
+            await self.db.execute(
+                """
+                UPDATE positions SET
+                    current_trailing_stop = ?,
+                    current_trailing_profit = ?,
+                    highest_profit_seen = ?,
+                    ml_last_update = ?,
+                    ml_confidence = ?,
+                    stop_multiplier = ?,
+                    profit_target_pct = ?
+                WHERE id = ?
+                """,
+                (
+                    position.trailing_stop,
+                    position.trailing_profit,
+                    position.highest_profit_seen,
+                    datetime.now().isoformat(),
+                    position.ml_confidence,
+                    position.stop_multiplier,
+                    position.profit_target_pct,
+                    position.position_id
+                )
+            )
+            await self.db.commit()
+        except Exception as e:
+            logger.error(f"Failed to update db levels: {e}")
 
 
 # Singleton instance

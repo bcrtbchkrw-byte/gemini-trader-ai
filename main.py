@@ -253,22 +253,30 @@ class GeminiTraderAI:
                 [c['symbol'] for c in candidates]
             )
             
-            # Gemini batch analysis
-            gemini_result = await self.gemini.batch_analyze_with_news(
-                candidates=candidates,
-                news_context=news_context,
-                vix=vix,
-                polymarket_data={
-                    'macro': macro_context,
-                    'crypto': crypto_sentiment
-                }
-            )
+            # Gemini batch analysis (COST CONTROLLED)
+            if self.config.ai.enable_gemini_phase2:
+                gemini_result = await self.gemini.batch_analyze_with_news(
+                    candidates=candidates,
+                    news_context=news_context,
+                    vix=vix,
+                    polymarket_data={
+                        'macro': macro_context,
+                        'crypto': crypto_sentiment
+                    }
+                )
+                
+                if not gemini_result['success']:
+                    logger.error(f"❌ Phase 2 failed: {gemini_result.get('error')}")
+                    return []
+                
+                top_picks = gemini_result['top_picks'][:3]  # Max 3
+            else:
+                logger.info("💰 Phase 2 Skipped (Cost Control Check). Passing all candidates.")
+                top_picks = [c['symbol'] for c in candidates][:5] # Pass top 5 raw
             
-            if not gemini_result['success']:
-                logger.error(f"❌ Phase 2 failed: {gemini_result.get('error')}")
+            if not top_picks:
+                logger.warning("❌ No stocks passed Phase 2 analysis")
                 return []
-            
-            top_picks = gemini_result['top_picks'][:3]  # Max 3
             
             if not top_picks:
                 logger.warning("❌ No stocks passed Phase 2 analysis")
@@ -307,11 +315,26 @@ class GeminiTraderAI:
                 logger.info(f"📈 Analyzing {symbol}...")
                 
                 try:
-                    # Fetch real Greeks from IBKR
+                    # 🧠 ML: DTE Optimizer (Dynamic Expiration)
+                    from ml.dte_optimizer import get_dte_optimizer
+                    dte_optimizer = get_dte_optimizer()
+                    
+                    # Fetch market data for DTE optimization
+                    vix_structure = await data_fetcher.get_vix_term_structure()
+                    
+                    # Predict optimal DTE
+                    opt_min_dte, opt_max_dte = dte_optimizer.predict_optimal_dte({
+                        'vix_term_structure': vix_structure,
+                        'iv_rank': 50  # TODO: Fetch real IV Rank if available in Phase 2 data
+                    })
+                    
+                    logger.info(f"   🗓️ Optimal DTE Window: {opt_min_dte}-{opt_max_dte} days (Structure: {vix_structure['structure']})")
+
+                    # Fetch real Greeks from IBKR using Optimized DTE
                     options_data = await data_fetcher.get_options_with_greeks(
                         symbol=symbol,
-                        min_dte=30,
-                        max_dte=45,
+                        min_dte=opt_min_dte,
+                        max_dte=opt_max_dte,
                         min_delta=0.15,
                         max_delta=0.25
                     )
@@ -338,7 +361,84 @@ class GeminiTraderAI:
                         'vanna': options_data[0].get('vanna', 0),
                         'impl_vol': options_data[0].get('impliedVolatility', 0),
                     }
-                    
+                    start_ml_check = True
+                    if start_ml_check:
+                         # =========================================================
+                         # PHASE 2.5: ML SUCCESS PREDICTOR (Gatekeeper)
+                         # =========================================================
+                         logger.info(f"   🤖 PHASE 2.5: ML Gatekeeper Analysis for {symbol}")
+                         
+                         try:
+                             from ml.trade_success_predictor import get_success_predictor
+                             from ml.probability_of_touch import get_pot_predictor
+                             import pandas as pd
+                             from datetime import datetime
+                             
+                             predictor = get_success_predictor()
+                             pot_predictor = get_pot_predictor()
+                             
+                             # 1. Fetch Data
+                             price_history = await data_fetcher.get_price_history(symbol, days=252)
+                             beta = await data_fetcher.get_beta(symbol)
+                             
+                             # 2. Calculate Technicals
+                             prices = pd.Series(price_history) if price_history else pd.Series([])
+                             rsi = 50.0
+                             sma_dist = 0.0
+                             
+                             if len(prices) >= 14:
+                                 delta = prices.diff()
+                                 gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+                                 loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                                 rs = gain / loss
+                                 rsi = 100 - (100 / (1 + rs)).iloc[-1]
+                                 
+                             if len(prices) >= 200:
+                                 sma_200 = prices.rolling(window=200).mean().iloc[-1]
+                                 sma_dist = (prices.iloc[-1] - sma_200) / sma_200
+                             
+                             # 3. Calculate PoT (Use first option as proxy)
+                             opt = options_data[0]
+                             expiration = datetime.strptime(opt['expiration'], '%Y%m%d')
+                             dte = (expiration - datetime.now()).days
+                             
+                             pot_res = pot_predictor.predict_probability_of_touch(
+                                 symbol=symbol,
+                                 strike=opt['strike'],
+                                 current_price=opt.get('stock_price', 0),
+                                 dte=dte,
+                                 iv=opt.get('impliedVolatility', 0.3)
+                             )
+                             pot_prob = pot_res.get('pot_probability', 0.5)
+                             
+                             # 4. Predict Success
+                             pred_data = {
+                                 'vix': vix,
+                                 'market_regime_val': 0, # Default to 0 if not mapped
+                                 'rsi': rsi,
+                                 'distance_to_sma200': sma_dist,
+                                 'iv_rank': opt.get('iv_rank', 50),
+                                 'beta': beta if beta else 1.0,
+                                 'delta': opt.get('delta', 0.5),
+                                 'dte': dte,
+                                 'pot_probability': pot_prob,
+                                 'day_of_week': datetime.now().weekday()
+                             }
+                             
+                             success_prob = predictor.predict(pred_data)
+                             
+                             if success_prob < 0.60:
+                                 logger.warning(
+                                     f"   ⛔ ML Gatekeeper REJECTED {symbol}: "
+                                     f"Prob {success_prob:.1%} < 60% (RSI={rsi:.0f}, PoT={pot_prob:.1%})"
+                                 )
+                                 continue
+                                 
+                             logger.info(f"   ✅ ML Gatekeeper PASSED: Prob {success_prob:.1%}")
+                             
+                         except Exception as ml_e:
+                             logger.error(f"   ⚠️ ML Gatekeeper error: {ml_e} - Proceeding with caution")
+
                     # Calculate Max Pain
                     from analysis.max_pain import get_max_pain_calculator
                     max_pain_calc = get_max_pain_calculator()
@@ -351,18 +451,30 @@ class GeminiTraderAI:
                         chain_oi = await data_fetcher.get_chain_open_interest(symbol, expiration)
                         max_pain = max_pain_calc.calculate_max_pain(chain_oi)
                     
-                    # Claude strategy analysis with confidence scoring
-                    claude_result = await self.claude.analyze_strategy(
-                        stock_data=stock_data,
-                        options_data=greeks_data,
-                        strategy_type="CREDIT_SPREAD",
-                        max_pain=max_pain  # Pass Max Pain to AI
-                    )
+                    # Claude strategy analysis with confidence scoring (COST CONTROLLED)
+                    if self.config.ai.enable_claude_phase3:
+                        claude_result = await self.claude.analyze_strategy(
+                            stock_data=stock_data,
+                            options_data=greeks_data,
+                            strategy_type="CREDIT_SPREAD",
+                            max_pain=max_pain  # Pass Max Pain to AI
+                        )
+                        
+                        # Extract confidence and decision
+                        confidence = claude_result.get('confidence_score', 0)
+                        decision = claude_result.get('decision', 'REJECT')
+                        approved = claude_result.get('approved', False)
+                    else:
+                        logger.info("💰 Phase 3 Skipped (Cost Control). Using Rule-Based Fallback.")
+                        # Simple rule-based approval if AI disabled
+                        confidence = 5.0
+                        decision = 'SKIPPED (Cost Saving)'
+                        approved = False 
+                        # Todo: Implement proper rule-based fallback here if desired
+                        # For now, we default to False to be safe (Safety First)
+                        
                     
-                    # Extract confidence and decision
-                    confidence = claude_result.get('confidence_score', 0)
-                    decision = claude_result.get('decision', 'REJECT')
-                    approved = claude_result.get('approved', False)
+                    # 🤖 ML DYNAMIC THRESHOLD: Check if we should override rejection
                     
                     # 🤖 ML DYNAMIC THRESHOLD: Check if we should override rejection
                     # If confidence is 8.0+ (normally rejected) but ML says it's a "Missed Opportunity"

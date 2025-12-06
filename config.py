@@ -31,9 +31,14 @@ class IBKRConfig:
 
 @dataclass
 class AIConfig:
-    """AI API configuration"""
+    """AI API configuration and cost controls"""
     gemini_api_key: Optional[str]
     anthropic_api_key: Optional[str]
+    
+    # Cost Control Toggles
+    enable_gemini_phase2: bool # Fundamental Analysis
+    enable_claude_phase3: bool # Strategy Analysis
+    enable_ai_rolling: bool    # AI Rolling Manager
     
     @classmethod
     def from_env(cls) -> 'AIConfig':
@@ -47,7 +52,10 @@ class AIConfig:
             
         return cls(
             gemini_api_key=gemini_key,
-            anthropic_api_key=anthropic_key
+            anthropic_api_key=anthropic_key,
+            enable_gemini_phase2=os.getenv('ENABLE_GEMINI_PHASE2', 'true').lower() == 'true',
+            enable_claude_phase3=os.getenv('ENABLE_CLAUDE_PHASE3', 'true').lower() == 'true',
+            enable_ai_rolling=os.getenv('ENABLE_AI_ROLLING', 'true').lower() == 'true'
         )
 
 

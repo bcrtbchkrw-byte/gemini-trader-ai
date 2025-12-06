@@ -4,7 +4,8 @@ Retrieves real-time market data, options chains, and Greeks from IBKR.
 """
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta
-from ib_insync import Stock, Option, Index, Contract
+import pandas as pd
+import numpy as np
 from loguru import logger
 from ibkr.connection import get_ibkr_connection
 from config import get_config
@@ -430,8 +431,52 @@ class IBKRDataFetcher:
                 return None
                 
         except Exception as e:
+                return None
+                
+        except Exception as e:
             logger.error(f"Error fetching price for {symbol}: {e}")
             return None
+
+    async def get_price_history(self, symbol: str, days: int = 252) -> List[float]:
+        """
+        Get historical closing prices
+        
+        Args:
+            symbol: Stock ticker
+            days: Number of days to fetch (252 = 1 year)
+            
+        Returns:
+            List of closing prices (oldest to newest)
+        """
+        try:
+            ib = self.connection.get_client()
+            
+            # Create stock contract
+            stock = Stock(symbol, 'SMART', 'USD')
+            await ib.qualifyContractsAsync(stock)
+            
+            # Request historical data
+            end_date = datetime.now()
+            
+            bars = await ib.reqHistoricalDataAsync(
+                stock,
+                endDateTime=end_date,
+                durationStr=f'{days} D',
+                barSizeSetting='1 day',
+                whatToShow='TRADES',
+                useRTH=True
+            )
+            
+            if not bars:
+                return []
+                
+            prices = [bar.close for bar in bars]
+            logger.info(f"Fetched {len(prices)} historical prices for {symbol}")
+            return prices
+            
+        except Exception as e:
+            logger.error(f"Error fetching history for {symbol}: {e}")
+            return []
     
     async def get_options_chain(
         self, 
@@ -954,36 +999,53 @@ class IBKRDataFetcher:
         except Exception as e:
             logger.error(f"Error getting VIX term structure: {e}")
             return {'vix': 0, 'vix3m': 0, 'ratio': 1.0, 'structure': 'UNKNOWN'}
+
+    async def get_unusual_options_volume(self, min_volume: int = 5000) -> List[Dict[str, Any]]:
+        """
+        Scan for options with unusual volume (Whale detector)
+        Uses IBKR Scanner logic: HOT_BY_OPT_VOLUME / OPT_VOLUME_OVR_INTEREST
+        """
+        try:
+            ib = self.connection.get_client()
+            
+            # Scanner: Hot by Option Volume
+            # Focus on US Stocks
+            sub = ScannerSubscription(
+                instrument='STK', 
+                locationCode='STK.US.MAJOR', 
+                scanCode='HOT_BY_OPT_VOLUME'
+            )
+            
+            # Add filtering (e.g., price > 20, volume > min_volume)
+            scan_data = await ib.reqScannerDataAsync(sub)
+            
+            logger.info(f"Scanner found {len(scan_data)} potential whale targets")
+            
+            results = []
+            for item in scan_data[:20]: # Top 20
+                contract = item.contractDetails.contract
+                rank = item.rank
                 
-                for contract, ticker in tickers:
-                    # IBKR maps Option Open Interest to 'futuresOpenInterest' in some versions,
-                    # or accessible via callOpenInterest/putOpenInterest if available.
-                    # For a single option contract, 'callOpenInterest' attribute might not exist on Ticker.
-                    # We check 'futuresOpenInterest' (often used for generic OI) or 'modelGreeks'.
-                    
-                    oi = 0
-                    # Try generic OI field (tick 101 maps to futuresOpenInterest in ib_insync for options too often)
-                    if ticker.futuresOpenInterest:
-                        oi = ticker.futuresOpenInterest
-                    
-                    # If not found, try modelGreeks (sometimes has it?) - No, modelGreeks has IV/Delta etc.
-                    
-                    if contract.strike not in strike_map:
-                        strike_map[contract.strike] = {'strike': contract.strike, 'call_oi': 0, 'put_oi': 0}
-                        
-                    if contract.right == 'C':
-                        strike_map[contract.strike]['call_oi'] = oi
-                    else:
-                        strike_map[contract.strike]['put_oi'] = oi
-                        
-                    # Cancel data
-                    ib.cancelMktData(contract)
-            
-            return list(strike_map.values())
-            
+                # Note: The scanner returns the UNDERLYING stock for 'STK' instrument
+                # But we want specific options.
+                # 'HOT_BY_OPT_VOLUME' returns stocks with high option volume.
+                # To get specific contracts, we need to inspect the chain or use 'OPT' instrument?
+                # IBKR Scanner for OPT is tricky. Usually returns underlying.
+                # Let's pivot: Identify stocks with high opt vol, then find the specific ACTIVE options.
+                
+                results.append({
+                    'rank': rank,
+                    'symbol': contract.symbol,
+                    'secType': contract.secType
+                })
+                
+            return results
+
         except Exception as e:
-            logger.error(f"Error fetching chain OI: {e}")
+            logger.error(f"Error in Unusual Volume Scanner: {e}")
             return []
+                
+
 
 
 # Singleton instance
